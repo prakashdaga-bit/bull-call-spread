@@ -223,24 +223,28 @@ if st.button("Analyze All"):
             html_table = summary_df.to_html(escape=False, index=False)
             
             # Display HTML Table
-            st.markdown(
-                f"""
+            # We separate the style and the table to avoid indentation issues
+            # Indented HTML strings in Python are often interpreted as Code Blocks by Markdown
+            
+            # 1. Inject CSS
+            st.markdown("""
                 <style>
-                table {{
+                table {
                     width: 100%;
                     border-collapse: collapse;
-                }}
-                th, td {{
+                }
+                th, td {
                     text-align: left;
                     padding: 8px;
                     border-bottom: 1px solid #444;
-                }}
-                tr:hover {{background-color: rgba(255, 255, 255, 0.1);}}
+                }
+                tr:hover {background-color: rgba(255, 255, 255, 0.1);}
                 </style>
-                {html_table}
-                """, 
-                unsafe_allow_html=True
-            )
+                """, unsafe_allow_html=True)
+
+            # 2. Inject Table HTML (Cleanly, without f-string indentation)
+            st.markdown(html_table, unsafe_allow_html=True)
+            
             st.caption("Click a stock ticker above to jump to its detailed analysis.")
 
         else:
