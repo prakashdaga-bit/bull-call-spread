@@ -144,8 +144,8 @@ def analyze_ticker(ticker_symbol):
                 })
 
                 # Data for Summary Table
-                # We label keys Month 1, Month 2, Month 3 to align columns in summary
-                summary_returns[f"Month {i+1}"] = f"{ret_pct:.1f}%"
+                # UPDATED: Use the specific date as key instead of "Month X"
+                summary_returns[date] = f"{ret_pct:.1f}%"
 
             except Exception as e:
                 # Skip individual dates if they fail
@@ -202,9 +202,11 @@ if st.button("Analyze All"):
         if all_summaries:
             summary_df = pd.DataFrame(all_summaries)
             
-            # Reorder columns to ensure Stock is first, then Months
-            # This ensures the table looks like: Stock | Month 1 | Month 2 | Month 3
-            cols = ["Stock"] + [c for c in summary_df.columns if c != "Stock"]
+            # Reorder columns to ensure Stock is first, then Dates chronologically
+            # Filter out 'Stock' column, sort the date strings, then combine
+            date_cols = sorted([c for c in summary_df.columns if c != "Stock"])
+            cols = ["Stock"] + date_cols
+            
             summary_df = summary_df[cols]
             
             # Display Summary
