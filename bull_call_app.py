@@ -75,9 +75,9 @@ def analyze_ticker(ticker_symbol):
 
         analysis_rows = []
         
-        # UPDATED: Use the anchor format '#TICKER' for the Stock column
-        # We will strip the '#' for display using column_config later
-        summary_returns = {"Stock": f"#{ticker_symbol}"}
+        # UPDATED: Just use the plain ticker symbol. 
+        # We will construct the HTML link manually in the display section.
+        summary_returns = {"Stock": ticker_symbol}
 
         for i, date in enumerate(target_dates):
             try:
@@ -212,19 +212,37 @@ if st.button("Analyze All"):
             
             summary_df = summary_df[cols]
             
-            # Display Summary with Links
-            st.dataframe(
-                summary_df,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Stock": st.column_config.LinkColumn(
-                        "Stock",
-                        display_text=r"^#(.+)$",  # Regex to extract text after '#'
-                        help="Click to jump to detailed analysis"
-                    )
-                }
+            # Convert Stock column to HTML links with target="_self"
+            # This prevents opening a new tab
+            summary_df['Stock'] = summary_df['Stock'].apply(
+                lambda x: f'<a href="#{x}" target="_self" style="text-decoration: none; font-weight: bold;">{x}</a>'
             )
+            
+            # Convert DataFrame to HTML
+            # escape=False is needed to render the <a> tags
+            html_table = summary_df.to_html(escape=False, index=False)
+            
+            # Display HTML Table
+            st.markdown(
+                f"""
+                <style>
+                table {{
+                    width: 100%;
+                    border-collapse: collapse;
+                }}
+                th, td {{
+                    text-align: left;
+                    padding: 8px;
+                    border-bottom: 1px solid #444;
+                }}
+                tr:hover {{background-color: rgba(255, 255, 255, 0.1);}}
+                </style>
+                {html_table}
+                """, 
+                unsafe_allow_html=True
+            )
+            st.caption("Click a stock ticker above to jump to its detailed analysis.")
+
         else:
             st.warning("No valid data found for any of the provided tickers.")
 
@@ -235,7 +253,8 @@ if st.button("Analyze All"):
         if all_details:
             for ticker, df in all_details.items():
                 # Inject a hidden HTML anchor for the link to jump to
-                st.markdown(f"<div id='{ticker}'></div>", unsafe_allow_html=True)
+                # The ID must match the href in the link (e.g., href='#NKE' -> id='NKE')
+                st.markdown(f"<div id='{ticker}' style='padding-top: 20px; margin-top: -20px;'></div>", unsafe_allow_html=True)
                 
                 with st.expander(f"{ticker} Analysis", expanded=True):
                     # Format and display with style
