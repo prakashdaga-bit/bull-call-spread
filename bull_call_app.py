@@ -74,7 +74,10 @@ def analyze_ticker(ticker_symbol):
             return None, None, f"No options data found for {ticker_symbol}."
 
         analysis_rows = []
-        summary_returns = {"Stock": ticker_symbol}
+        
+        # UPDATED: Use the anchor format '#TICKER' for the Stock column
+        # We will strip the '#' for display using column_config later
+        summary_returns = {"Stock": f"#{ticker_symbol}"}
 
         for i, date in enumerate(target_dates):
             try:
@@ -209,11 +212,18 @@ if st.button("Analyze All"):
             
             summary_df = summary_df[cols]
             
-            # Display Summary
+            # Display Summary with Links
             st.dataframe(
                 summary_df,
                 use_container_width=True,
-                hide_index=True
+                hide_index=True,
+                column_config={
+                    "Stock": st.column_config.LinkColumn(
+                        "Stock",
+                        display_text=r"^#(.+)$",  # Regex to extract text after '#'
+                        help="Click to jump to detailed analysis"
+                    )
+                }
             )
         else:
             st.warning("No valid data found for any of the provided tickers.")
@@ -224,6 +234,9 @@ if st.button("Analyze All"):
 
         if all_details:
             for ticker, df in all_details.items():
+                # Inject a hidden HTML anchor for the link to jump to
+                st.markdown(f"<div id='{ticker}'></div>", unsafe_allow_html=True)
+                
                 with st.expander(f"{ticker} Analysis", expanded=True):
                     # Format and display with style
                     st.dataframe(
