@@ -45,6 +45,16 @@ def find_closest_strike(chain, price_target):
     # Sort by difference and take the top one
     return chain.sort_values('abs_diff').iloc[0]
 
+def get_price(option_row, price_type='ask'):
+    """
+    Robust price fetcher.
+    If 'ask' or 'bid' is 0 (common in free data feeds), falls back to 'lastPrice'.
+    """
+    price = option_row.get(price_type, 0)
+    if price == 0:
+        return option_row.get('lastPrice', 0)
+    return price
+
 def analyze_ticker(ticker_symbol, strategy_type):
     """
     Performs option strategy analysis for a single ticker.
@@ -82,10 +92,12 @@ def analyze_ticker(ticker_symbol, strategy_type):
                 calls = opt_chain.calls
                 puts = opt_chain.puts
                 
-                if calls.empty or puts.empty:
+                if calls.empty and puts.empty:
                     continue
 
                 if strategy_type == "Bull Call Spread":
+                    if calls.empty: continue
+                    
                     # --- BULL CALL SPREAD LOGIC ---
                     target_price = cmp * 1.05
                     long_leg = find_closest_strike(calls, cmp)
@@ -101,10 +113,13 @@ def analyze_ticker(ticker_symbol, strategy_type):
 
                     buy_strike = long_leg['strike']
                     sell_strike = short_leg['strike']
-                    long_ask = long_leg['ask']
-                    short_bid = short_leg['bid']
+                    
+                    # UPDATED: Use robust pricing (Fallback to lastPrice if Ask/Bid is 0)
+                    long_ask = get_price(long_leg, 'ask')
+                    short_bid = get_price(short_leg, 'bid')
 
-                    if long_ask == 0 or short_bid == 0: continue
+                    # If even lastPrice is 0, then we really can't trade it
+                    if long_ask == 0: continue
 
                     net_cost = long_ask - short_bid
                     spread_width = sell_strike - buy_strike
@@ -127,19 +142,27 @@ def analyze_ticker(ticker_symbol, strategy_type):
                     summary_returns[date] = f"{ret_pct:.1f}%"
 
                 elif strategy_type == "Long Straddle":
-                    # --- LONG STRADDLE LOGIC ---
-                    # Buy ATM Call + Buy ATM Put
-                    atm_call = find_closest_strike(calls, cmp)
-                    strike = atm_call['strike']
+                    if calls.empty or puts.empty: continue
                     
-                    # Find matching put at same strike
-                    atm_put = puts[puts['strike'] == strike]
-                    if atm_put.empty:
+                    # --- LONG STRADDLE LOGIC ---
+                    # 1. Find common strikes
+                    common_strikes = set(calls['strike']).intersection(set(puts['strike']))
+                    
+                    if not common_strikes:
                         continue
-                    atm_put = atm_put.iloc[0]
+                        
+                    # 2. Find the strike closest to CMP among ONLY the common strikes
+                    available_strikes = pd.DataFrame({'strike': list(common_strikes)})
+                    closest_row = find_closest_strike(available_strikes, cmp)
+                    strike = closest_row['strike']
+                    
+                    # 3. Retrieve the specific Call and Put rows for that strike
+                    atm_call = calls[calls['strike'] == strike].iloc[0]
+                    atm_put = puts[puts['strike'] == strike].iloc[0]
 
-                    call_ask = atm_call['ask']
-                    put_ask = atm_put['ask']
+                    # UPDATED: Use robust pricing
+                    call_ask = get_price(atm_call, 'ask')
+                    put_ask = get_price(atm_put, 'ask')
 
                     if call_ask == 0 or put_ask == 0: continue
 
