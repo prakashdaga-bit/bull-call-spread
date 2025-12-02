@@ -4,7 +4,7 @@ import pandas as pd
 import datetime
 
 # --- Configuration ---
-st.set_page_config(page_title="Multi-Stock Bull Call Analyzer", page_icon="📈", layout="wide")
+st.set_page_config(page_title="Multi-Stock Strategy Analyzer", page_icon="📈", layout="wide")
 
 # --- Helper Functions ---
 def get_monthly_expirations(ticker_obj, limit=3):
@@ -45,11 +45,11 @@ def find_closest_strike(chain, price_target):
     # Sort by difference and take the top one
     return chain.sort_values('abs_diff').iloc[0]
 
-def analyze_ticker(ticker_symbol):
+def analyze_ticker(ticker_symbol, strategy_type):
     """
-    Performs the bull call analysis for a single ticker.
+    Performs option strategy analysis for a single ticker.
     Returns:
-        dict: Summary data (returns per month)
+        dict: Summary data
         DataFrame: Detailed analysis table
         str: Error message if any
     """
@@ -67,16 +67,12 @@ def analyze_ticker(ticker_symbol):
                 return None, None, f"No price data found for {ticker_symbol}."
             cmp = hist['Close'].iloc[-1]
 
-        target_price = cmp * 1.05
         target_dates = get_monthly_expirations(stock, limit=3)
         
         if not target_dates:
             return None, None, f"No options data found for {ticker_symbol}."
 
         analysis_rows = []
-        
-        # UPDATED: Just use the plain ticker symbol. 
-        # We will construct the HTML link manually in the display section.
         summary_returns = {"Stock": ticker_symbol}
 
         for i, date in enumerate(target_dates):
@@ -84,74 +80,89 @@ def analyze_ticker(ticker_symbol):
                 # Get Option Chain for specific date
                 opt_chain = stock.option_chain(date)
                 calls = opt_chain.calls
+                puts = opt_chain.puts
                 
-                if calls.empty:
+                if calls.empty or puts.empty:
                     continue
 
-                # --- SPREAD CONSTRUCTION ---
-                
-                # Long Leg (Buy) @ CMP
-                long_leg = find_closest_strike(calls, cmp)
-                
-                # Short Leg (Sell) @ Target Price
-                short_leg = find_closest_strike(calls, target_price)
+                if strategy_type == "Bull Call Spread":
+                    # --- BULL CALL SPREAD LOGIC ---
+                    target_price = cmp * 1.05
+                    long_leg = find_closest_strike(calls, cmp)
+                    short_leg = find_closest_strike(calls, target_price)
 
-                # Ensure strikes are different
-                if long_leg['strike'] == short_leg['strike']:
-                    # Force short leg to be the next strike up if they collided
-                    idx = calls[calls['strike'] > long_leg['strike']].index
-                    if not idx.empty:
-                        short_leg = calls.loc[idx[0]]
-                    else:
-                        continue # Cannot build spread
+                    # Ensure strikes are different
+                    if long_leg['strike'] == short_leg['strike']:
+                        idx = calls[calls['strike'] > long_leg['strike']].index
+                        if not idx.empty:
+                            short_leg = calls.loc[idx[0]]
+                        else:
+                            continue 
 
-                # --- CALCULATIONS ---
-                
-                # Prices
-                buy_strike = long_leg['strike']
-                sell_strike = short_leg['strike']
-                
-                # Cost to Buy Long (Ask Price)
-                # Cost to Sell Short (Bid Price)
-                long_ask = long_leg['ask']
-                short_bid = short_leg['bid']
-                
-                # Validation: If liquidity is zero (no Ask or no Bid), skip
-                if long_ask == 0 or short_bid == 0:
-                    continue
+                    buy_strike = long_leg['strike']
+                    sell_strike = short_leg['strike']
+                    long_ask = long_leg['ask']
+                    short_bid = short_leg['bid']
 
-                # Net Cost (Debit)
-                net_cost = long_ask - short_bid
-                
-                # Max Gain: (Width of Spread) - Net Cost
-                spread_width = sell_strike - buy_strike
-                max_gain = spread_width - net_cost
-                
-                # Breakeven
-                breakeven = buy_strike + net_cost
-                
-                # Return %
-                ret_pct = 0
-                if net_cost > 0:
-                    ret_pct = (max_gain / net_cost) * 100
+                    if long_ask == 0 or short_bid == 0: continue
 
-                # Data for Detailed Table
-                analysis_rows.append({
-                    "Expiration": date,
-                    "Buy Strike": buy_strike,
-                    "Sell Strike": sell_strike,
-                    "Net Cost": net_cost,
-                    "Max Gain": max_gain,
-                    "Return %": ret_pct,
-                    "Breakeven": breakeven
-                })
+                    net_cost = long_ask - short_bid
+                    spread_width = sell_strike - buy_strike
+                    max_gain = spread_width - net_cost
+                    breakeven = buy_strike + net_cost
+                    
+                    ret_pct = 0
+                    if net_cost > 0:
+                        ret_pct = (max_gain / net_cost) * 100
 
-                # Data for Summary Table
-                # UPDATED: Use the specific date as key instead of "Month X"
-                summary_returns[date] = f"{ret_pct:.1f}%"
+                    analysis_rows.append({
+                        "Expiration": date,
+                        "Buy Strike": buy_strike,
+                        "Sell Strike": sell_strike,
+                        "Net Cost": net_cost,
+                        "Max Gain": max_gain,
+                        "Return %": ret_pct,
+                        "Breakeven": breakeven
+                    })
+                    summary_returns[date] = f"{ret_pct:.1f}%"
+
+                elif strategy_type == "Long Straddle":
+                    # --- LONG STRADDLE LOGIC ---
+                    # Buy ATM Call + Buy ATM Put
+                    atm_call = find_closest_strike(calls, cmp)
+                    strike = atm_call['strike']
+                    
+                    # Find matching put at same strike
+                    atm_put = puts[puts['strike'] == strike]
+                    if atm_put.empty:
+                        continue
+                    atm_put = atm_put.iloc[0]
+
+                    call_ask = atm_call['ask']
+                    put_ask = atm_put['ask']
+
+                    if call_ask == 0 or put_ask == 0: continue
+
+                    net_cost = call_ask + put_ask
+                    breakeven_low = strike - net_cost
+                    breakeven_high = strike + net_cost
+                    
+                    # Calculate % Move required to Breakeven
+                    move_pct = (net_cost / cmp) * 100
+
+                    analysis_rows.append({
+                        "Expiration": date,
+                        "Strike": strike,
+                        "Call Cost": call_ask,
+                        "Put Cost": put_ask,
+                        "Net Cost": net_cost,
+                        "BE Low": breakeven_low,
+                        "BE High": breakeven_high,
+                        "Move Needed": move_pct
+                    })
+                    summary_returns[date] = f"±{move_pct:.1f}%"
 
             except Exception as e:
-                # Skip individual dates if they fail
                 continue
 
         if not analysis_rows:
@@ -163,10 +174,18 @@ def analyze_ticker(ticker_symbol):
         return None, None, str(e)
 
 # --- Main App Interface ---
-st.title("📈 Multi-Stock Bull Call Analyzer")
-st.markdown("Analyze Bull Call Spreads (Target +5%) for multiple stocks simultaneously.")
+st.title("📈 Multi-Stock Strategy Analyzer")
+st.markdown("Analyze options strategies for multiple stocks simultaneously.")
 
-# Input Section
+# 1. Strategy Selector
+strategy = st.radio(
+    "Select Strategy:",
+    ("Bull Call Spread", "Long Straddle"),
+    horizontal=True,
+    help="Bull Call: Bullish Directional (Target +5%).\nLong Straddle: Volatility Play (Betting on big move either way)."
+)
+
+# 2. Ticker Input
 default_tickers = "NKE, AAPL, AMD, TSLA"
 ticker_input = st.text_input("Enter Stock Tickers (comma-separated):", value=default_tickers)
 
@@ -178,16 +197,14 @@ if st.button("Analyze All"):
         tickers = [t.strip().upper() for t in ticker_input.split(',') if t.strip()]
         
         all_summaries = []
-        all_details = {} # Map ticker -> DataFrame
+        all_details = {} 
         errors = []
 
-        # Create a progress bar
         progress_bar = st.progress(0)
         
-        with st.spinner("Fetching data and calculating strategies..."):
+        with st.spinner(f"Calculating {strategy} for tickers..."):
             for i, ticker in enumerate(tickers):
-                # Analyze each ticker
-                summary, df, error = analyze_ticker(ticker)
+                summary, df, error = analyze_ticker(ticker, strategy)
                 
                 if error:
                     errors.append(f"{ticker}: {error}")
@@ -195,84 +212,79 @@ if st.button("Analyze All"):
                     all_summaries.append(summary)
                     all_details[ticker] = df
                 
-                # Update progress
                 progress_bar.progress((i + 1) / len(tickers))
 
         # --- 1. Summary Table Output ---
         st.divider()
-        st.header("1. Summary: Return Potential")
+        st.header("1. Summary Table")
+        
+        # Dynamic Help Text
+        if strategy == "Bull Call Spread":
+            st.info("Values represent **Return on Investment (ROI)** if stock hits target.")
+        else:
+            st.info("Values represent **% Move Required** to break even (Lower is better).")
         
         if all_summaries:
             summary_df = pd.DataFrame(all_summaries)
             
-            # Reorder columns to ensure Stock is first, then Dates chronologically
-            # Filter out 'Stock' column, sort the date strings, then combine
+            # Sort columns
             date_cols = sorted([c for c in summary_df.columns if c != "Stock"])
             cols = ["Stock"] + date_cols
-            
             summary_df = summary_df[cols]
             
-            # Convert Stock column to HTML links with target="_self"
-            # This prevents opening a new tab
+            # HTML Link Logic
             summary_df['Stock'] = summary_df['Stock'].apply(
                 lambda x: f'<a href="#{x}" target="_self" style="text-decoration: none; font-weight: bold;">{x}</a>'
             )
             
-            # Convert DataFrame to HTML
-            # escape=False is needed to render the <a> tags
             html_table = summary_df.to_html(escape=False, index=False)
             
-            # Display HTML Table
-            # We separate the style and the table to avoid indentation issues
-            # Indented HTML strings in Python are often interpreted as Code Blocks by Markdown
-            
-            # 1. Inject CSS
             st.markdown("""
                 <style>
-                table {
-                    width: 100%;
-                    border-collapse: collapse;
-                }
-                th, td {
-                    text-align: left;
-                    padding: 8px;
-                    border-bottom: 1px solid #444;
-                }
+                table { width: 100%; border-collapse: collapse; }
+                th, td { text-align: left; padding: 8px; border-bottom: 1px solid #444; }
                 tr:hover {background-color: rgba(255, 255, 255, 0.1);}
                 </style>
                 """, unsafe_allow_html=True)
 
-            # 2. Inject Table HTML (Cleanly, without f-string indentation)
             st.markdown(html_table, unsafe_allow_html=True)
-            
             st.caption("Click a stock ticker above to jump to its detailed analysis.")
 
         else:
-            st.warning("No valid data found for any of the provided tickers.")
+            st.warning("No valid data found.")
 
         # --- 2. Detailed Outputs ---
         st.divider()
-        st.header("2. Detailed Strategy Breakdown")
+        st.header("2. Detailed Analysis")
 
         if all_details:
             for ticker, df in all_details.items():
-                # Inject a hidden HTML anchor for the link to jump to
-                # The ID must match the href in the link (e.g., href='#NKE' -> id='NKE')
                 st.markdown(f"<div id='{ticker}' style='padding-top: 20px; margin-top: -20px;'></div>", unsafe_allow_html=True)
                 
-                with st.expander(f"{ticker} Analysis", expanded=True):
-                    # Format and display with style
-                    st.dataframe(
-                        df.style.format({
+                with st.expander(f"{ticker} Analysis ({strategy})", expanded=True):
+                    # Dynamic Formatting based on Strategy
+                    if strategy == "Bull Call Spread":
+                        format_dict = {
                             "Net Cost": "${:.2f}",
                             "Max Gain": "${:.2f}",
                             "Breakeven": "${:.2f}",
                             "Return %": "{:.1f}%"
-                        }),
+                        }
+                    else: # Long Straddle
+                        format_dict = {
+                            "Call Cost": "${:.2f}",
+                            "Put Cost": "${:.2f}",
+                            "Net Cost": "${:.2f}",
+                            "BE Low": "${:.2f}",
+                            "BE High": "${:.2f}",
+                            "Move Needed": "{:.1f}%"
+                        }
+
+                    st.dataframe(
+                        df.style.format(format_dict),
                         use_container_width=True
                     )
         
-        # Show errors if any occurred
         if errors:
             with st.expander("Errors / Skipped Tickers"):
                 for err in errors:
