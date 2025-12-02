@@ -209,7 +209,7 @@ strategy = st.radio(
 )
 
 # 2. Ticker Input
-default_tickers = "NKE, AAPL, AMD, TSLA"
+default_tickers = "AAPL, AMD, TSLA"
 ticker_input = st.text_input("Enter Stock Tickers (comma-separated):", value=default_tickers)
 
 if st.button("Analyze All"):
