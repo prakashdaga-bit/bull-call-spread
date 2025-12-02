@@ -36,10 +36,38 @@ def get_monthly_expirations(ticker_obj, limit=3):
             
     return unique_months
 
+def filter_tradeable_options(chain):
+    """
+    Filters the option chain to keep only rows where Ask > 0 or LastPrice > 0.
+    This prevents selecting illiquid strikes that result in data errors.
+    """
+    if chain.empty:
+        return chain
+    
+    # Ensure columns exist to avoid KeyErrors
+    cols = chain.columns
+    has_ask = 'ask' in cols
+    has_last = 'lastPrice' in cols
+    
+    if not has_ask and not has_last:
+        return pd.DataFrame() # Cannot validate prices
+        
+    # Construct mask: Keep if Ask > 0 OR LastPrice > 0
+    mask = pd.Series(False, index=chain.index)
+    if has_ask:
+        mask |= (chain['ask'] > 0)
+    if has_last:
+        mask |= (chain['lastPrice'] > 0)
+        
+    return chain[mask]
+
 def find_closest_strike(chain, price_target):
     """
     Finds the option row with the strike price closest to the price_target.
     """
+    if chain.empty:
+        return None
+        
     chain = chain.copy()
     chain['abs_diff'] = (chain['strike'] - price_target).abs()
     # Sort by difference and take the top one
@@ -70,6 +98,10 @@ def analyze_ticker(ticker_symbol, strategy_type):
         try:
             # fast_info is generally faster for live prices
             cmp = stock.fast_info['last_price']
+            
+            # Check for None (sometimes happens with yfinance for Intl stocks)
+            if cmp is None:
+                raise ValueError("Fast info returned None")
         except:
             # Fallback to history if fast_info fails
             hist = stock.history(period='1d')
@@ -98,27 +130,34 @@ def analyze_ticker(ticker_symbol, strategy_type):
                 if strategy_type == "Bull Call Spread":
                     if calls.empty: continue
                     
+                    # 1. Filter for tradeable calls ONLY
+                    valid_calls = filter_tradeable_options(calls)
+                    if valid_calls.empty: continue
+                    
                     # --- BULL CALL SPREAD LOGIC ---
                     target_price = cmp * 1.05
-                    long_leg = find_closest_strike(calls, cmp)
-                    short_leg = find_closest_strike(calls, target_price)
+                    long_leg = find_closest_strike(valid_calls, cmp)
+                    short_leg = find_closest_strike(valid_calls, target_price)
+
+                    # Check if valid legs were found
+                    if long_leg is None or short_leg is None: continue
 
                     # Ensure strikes are different
                     if long_leg['strike'] == short_leg['strike']:
-                        idx = calls[calls['strike'] > long_leg['strike']].index
-                        if not idx.empty:
-                            short_leg = calls.loc[idx[0]]
+                        # Try to find next strike up in valid calls
+                        higher_strikes = valid_calls[valid_calls['strike'] > long_leg['strike']]
+                        if not higher_strikes.empty:
+                            short_leg = higher_strikes.iloc[0]
                         else:
                             continue 
 
                     buy_strike = long_leg['strike']
                     sell_strike = short_leg['strike']
                     
-                    # UPDATED: Use robust pricing (Fallback to lastPrice if Ask/Bid is 0)
+                    # Get Prices
                     long_ask = get_price(long_leg, 'ask')
                     short_bid = get_price(short_leg, 'bid')
 
-                    # If even lastPrice is 0, then we really can't trade it
                     if long_ask == 0: continue
 
                     net_cost = long_ask - short_bid
@@ -144,23 +183,30 @@ def analyze_ticker(ticker_symbol, strategy_type):
                 elif strategy_type == "Long Straddle":
                     if calls.empty or puts.empty: continue
                     
+                    # 1. Filter both chains
+                    valid_calls = filter_tradeable_options(calls)
+                    valid_puts = filter_tradeable_options(puts)
+                    
+                    if valid_calls.empty or valid_puts.empty: continue
+
                     # --- LONG STRADDLE LOGIC ---
-                    # 1. Find common strikes
-                    common_strikes = set(calls['strike']).intersection(set(puts['strike']))
+                    # 2. Find common strikes in VALID chains only
+                    common_strikes = set(valid_calls['strike']).intersection(set(valid_puts['strike']))
                     
                     if not common_strikes:
                         continue
                         
-                    # 2. Find the strike closest to CMP among ONLY the common strikes
+                    # 3. Find the strike closest to CMP among valid common strikes
                     available_strikes = pd.DataFrame({'strike': list(common_strikes)})
                     closest_row = find_closest_strike(available_strikes, cmp)
+                    
+                    if closest_row is None: continue
                     strike = closest_row['strike']
                     
-                    # 3. Retrieve the specific Call and Put rows for that strike
-                    atm_call = calls[calls['strike'] == strike].iloc[0]
-                    atm_put = puts[puts['strike'] == strike].iloc[0]
+                    # 4. Retrieve rows
+                    atm_call = valid_calls[valid_calls['strike'] == strike].iloc[0]
+                    atm_put = valid_puts[valid_puts['strike'] == strike].iloc[0]
 
-                    # UPDATED: Use robust pricing
                     call_ask = get_price(atm_call, 'ask')
                     put_ask = get_price(atm_put, 'ask')
 
