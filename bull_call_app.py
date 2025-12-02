@@ -209,8 +209,13 @@ strategy = st.radio(
 )
 
 # 2. Ticker Input
-default_tickers = "AAPL, AMD, TSLA"
-ticker_input = st.text_input("Enter Stock Tickers (comma-separated):", value=default_tickers)
+# UPDATED: Added help text for international tickers
+default_tickers = "NKE, AAPL, AMD, TSLA"
+ticker_input = st.text_input(
+    "Enter Stock Tickers (comma-separated):", 
+    value=default_tickers,
+    help="US: AAPL, TSLA. India NSE: RELIANCE.NS, TCS.NS. India BSE: 500325.BO"
+)
 
 if st.button("Analyze All"):
     if not ticker_input:
