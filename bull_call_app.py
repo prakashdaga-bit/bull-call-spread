@@ -3,6 +3,7 @@ import yfinance as yf
 import pandas as pd
 import datetime
 import time
+import random
 
 # --- Configuration ---
 st.set_page_config(page_title="Multi-Stock Strategy Analyzer", page_icon="📈", layout="wide")
@@ -75,6 +76,22 @@ def get_price(option_row, price_type='ask'):
         return option_row.get('lastPrice', 0)
     return price
 
+def get_option_chain_with_retry(stock, date, retries=3):
+    """
+    Fetches option chain with exponential backoff to handle rate limits.
+    """
+    for i in range(retries):
+        try:
+            return stock.option_chain(date)
+        except Exception as e:
+            if i == retries - 1: # Last attempt failed
+                raise e
+            
+            # Exponential backoff with jitter: 2s, 4s, 8s... + random
+            sleep_time = (2 ** (i + 1)) + random.uniform(0.5, 1.5)
+            time.sleep(sleep_time)
+    return None
+
 # --- Core Analysis Logic (Cached) ---
 # We cache this function so switching strategies doesn't re-trigger API calls
 # TTL (Time To Live) is set to 600 seconds (10 minutes)
@@ -105,11 +122,13 @@ def fetch_and_analyze_ticker(ticker_symbol, strategy_type):
         summary_returns = {"Stock": ticker_symbol}
 
         for i, date in enumerate(target_dates):
-            # Anti-Rate Limit: Sleep 1 second between option chain fetches
-            time.sleep(1) 
+            # Anti-Rate Limit: Random sleep between 1.5 to 3 seconds
+            # This randomness helps avoid detection patterns
+            time.sleep(random.uniform(1.5, 3.0)) 
             
             try:
-                opt_chain = stock.option_chain(date)
+                # Use the robust fetcher with retries
+                opt_chain = get_option_chain_with_retry(stock, date)
                 calls = opt_chain.calls
                 puts = opt_chain.puts
                 
