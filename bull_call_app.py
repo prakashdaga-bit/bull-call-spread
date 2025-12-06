@@ -37,6 +37,17 @@ class BullCallSpreadConfig:
     max_debit_to_width_ratio: float
     min_profit_to_risk_ratio: float
 
+@dataclass
+class LongStraddleConfig:
+    """Configuration for Long Straddle (Explosive Move / Long Volatility)"""
+    min_daily_volume: int
+    min_open_interest: int
+    max_iv_rank: float  # Prefer buying when Vol is low (cheap)
+    target_dte_min: int
+    target_dte_max: int
+    delta_tolerance: float # Tolerance for finding ATM strikes
+    max_cost_pct: float    # Max cost as % of stock price (e.g. don't pay > 10% of stock price)
+
 # ==========================================
 # 2. DATA MODELS
 # ==========================================
@@ -261,6 +272,82 @@ class BullCallSpreadStrategy(StrategyBase):
             "risk_reward": risk_reward
         }
 
+class LongStraddleStrategy(StrategyBase):
+    def __init__(self, config: LongStraddleConfig):
+        super().__init__()
+        self.config = config
+        self.name = "Long Straddle"
+
+    def check_filters(self, stock: StockData) -> bool:
+        if stock.avg_daily_volume < self.config.min_daily_volume:
+            self.log(f"❌ FAIL: Low Volume {stock.avg_daily_volume:,}")
+            return False
+        
+        # We want to buy when options are CHEAP (Low IV) before a move
+        if stock.iv_rank > self.config.max_iv_rank:
+            self.log(f"❌ FAIL: IV Rank {stock.iv_rank} is too high (Options expensive)")
+            return False
+            
+        self.log("✅ Phase 1: Universe Filters Passed")
+        return True
+
+    def find_strikes(self, stock: StockData, chain: List[OptionContract]):
+        valid_expiry = [
+            opt for opt in chain 
+            if self.config.target_dte_min <= opt.expiry_days <= self.config.target_dte_max
+        ]
+        
+        # Find ATM options (closest to stock price, or Delta ~0.50)
+        # Using simple distance to spot price here
+        
+        candidates = [o for o in valid_expiry if o.open_interest >= self.config.min_open_interest]
+        if not candidates:
+            self.log("❌ FAIL: No liquid options found")
+            return None
+            
+        # Sort by distance from spot price
+        closest_strike = min(candidates, key=lambda x: abs(x.strike - stock.price)).strike
+        
+        # Get the Call and Put at this strike
+        atm_call = next((o for o in candidates if o.strike == closest_strike and o.option_type == 'call'), None)
+        atm_put = next((o for o in candidates if o.strike == closest_strike and o.option_type == 'put'), None)
+        
+        if not atm_call or not atm_put:
+             self.log(f"❌ FAIL: Could not find matching Call/Put at strike {closest_strike}")
+             return None
+             
+        self.log(f"✅ Phase 2: Geometry Found (ATM Strike {closest_strike})")
+        return {"long_call": atm_call, "long_put": atm_put, "stock_price": stock.price}
+
+    def validate_trade(self, legs):
+        lc = legs['long_call']
+        lp = legs['long_put']
+        stock_price = legs['stock_price']
+        
+        # Cost = Call Price + Put Price
+        debit = lc.mid_price + lp.mid_price
+        debit = round(debit, 2)
+        
+        # Breakevens
+        be_upper = lc.strike + debit
+        be_lower = lp.strike - debit
+        
+        # Constraint: Cost Efficiency
+        # If the straddle costs 20% of the stock price, it's very hard to win.
+        cost_pct = debit / stock_price
+        if cost_pct > self.config.max_cost_pct:
+            self.log(f"⛔ ABORT: Cost ${debit} is {cost_pct:.1%} of Stock Price (Max {self.config.max_cost_pct:.1%})")
+            return None
+            
+        return {
+            "type": "Long Straddle",
+            "strikes": f"Buy {lc.strike} Call & Put",
+            "debit": debit,
+            "max_profit": "Unlimited",
+            "breakevens": f"Below ${be_lower:.2f} / Above ${be_upper:.2f}",
+            "cost_pct": f"{cost_pct:.1%}"
+        }
+
 # ==========================================
 # 4. STREAMLIT UI IMPLEMENTATION
 # ==========================================
@@ -312,7 +399,7 @@ def main():
 
     # --- SIDEBAR: STRATEGY CONFIG ---
     st.sidebar.header("Strategy Settings")
-    strategy_choice = st.sidebar.selectbox("Select Strategy", ["Iron Condor", "Bull Call Spread"])
+    strategy_choice = st.sidebar.selectbox("Select Strategy", ["Iron Condor", "Bull Call Spread", "Long Straddle"])
 
     config = None
     if strategy_choice == "Iron Condor":
@@ -328,7 +415,7 @@ def main():
             target_delta=target_delta, delta_tolerance=0.04,
             min_credit_to_width_ratio=min_credit_ratio, min_pop=min_pop, min_ror=0.15
         )
-    else:
+    elif strategy_choice == "Bull Call Spread":
         st.sidebar.subheader("Bull Call Constraints")
         max_iv = st.sidebar.number_input("Max IV Rank (Buy Low Vol)", value=50, step=5)
         long_delta = st.sidebar.slider("Long Call Delta", 0.40, 0.80, 0.55, 0.05)
@@ -339,6 +426,16 @@ def main():
             target_dte_min=45, target_dte_max=90, long_call_delta=long_delta,
             short_call_delta=short_delta, delta_tolerance=0.05,
             max_debit_to_width_ratio=0.50, min_profit_to_risk_ratio=1.0
+        )
+    else:
+        st.sidebar.subheader("Long Straddle Constraints")
+        max_iv = st.sidebar.number_input("Max IV Rank (Cheap Premium)", value=40, step=5)
+        max_cost = st.sidebar.slider("Max Cost (% of Stock Price)", 0.02, 0.15, 0.08, 0.01)
+        
+        config = LongStraddleConfig(
+            min_daily_volume=1000000, min_open_interest=500, max_iv_rank=max_iv,
+            target_dte_min=14, target_dte_max=60, delta_tolerance=0.10,
+            max_cost_pct=max_cost
         )
 
     # --- MAIN AREA: TICKER INPUT ---
@@ -368,8 +465,10 @@ def main():
         # 3. Initialize Strategy
         if strategy_choice == "Iron Condor":
             algo = IronCondorStrategy(config)
-        else:
+        elif strategy_choice == "Bull Call Spread":
             algo = BullCallSpreadStrategy(config)
+        else:
+            algo = LongStraddleStrategy(config)
 
         # 4. Execute Logic
         col_log, col_res = st.columns([1, 1])
@@ -409,10 +508,15 @@ def main():
                     m1.metric("Credit Received", f"${result['credit']}")
                     m2.metric("Max Risk", f"${result['max_risk']}")
                     m3.metric("POP", f"{result['pop']:.1%}")
+                elif 'breakevens' in result:
+                    m1.metric("Total Debit", f"${result['debit']}")
+                    m2.metric("Cost %", result['cost_pct'])
+                    m3.metric("Breakevens", "See Below")
+                    st.info(f"Breakevens: {result['breakevens']}")
                 else:
                     m1.metric("Debit Paid", f"${result['debit']}")
                     m2.metric("Max Profit", f"${result['max_profit']}")
-                    m3.metric("Risk/Reward", f"{result['risk_reward']:.2f}")
+                    m3.metric("Risk/Reward", f"{result['risk_reward']}")
 
             elif not passed_filters:
                 st.warning("🚫 Trade Rejected at Phase 1 (Filters)")
