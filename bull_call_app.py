@@ -198,7 +198,7 @@ def analyze_custom_strategy(ticker, sentiment, volatility_high):
     
     Logic:
     1. Fetch real price and chain.
-    2. Determine Strikes: -33%, -8%, +8%, +33%.
+    2. Determine Strikes: -15%, -8%, +8%, +15%.
     3. Determine Action (Buy/Sell) based on Sentiment & Volatility.
     """
     try:
@@ -225,11 +225,11 @@ def analyze_custom_strategy(ticker, sentiment, volatility_high):
         if calls.empty or puts.empty: return None, "Chain data incomplete (missing calls or puts)."
 
         # 2. Identify Strikes
-        # Targets: -33% (0.67), -8% (0.92), +8% (1.08), +33% (1.33)
-        k_put_far_target = current_price * 0.67
+        # Targets: -15% (0.85), -8% (0.92), +8% (1.08), +15% (1.15)
+        k_put_far_target = current_price * 0.85
         k_put_near_target = current_price * 0.92
         k_call_near_target = current_price * 1.08
-        k_call_far_target = current_price * 1.33
+        k_call_far_target = current_price * 1.15
         
         # Find actual contracts
         put_far = find_closest_strike(puts, k_put_far_target)
@@ -242,8 +242,8 @@ def analyze_custom_strategy(ticker, sentiment, volatility_high):
             
         # 3. Determine Strategy Structure
         # Default Template (<10% Move):
-        #   Put Side: Buy Far (-33%), Sell Near (-8%) -> Bull Put Spread (Credit)
-        #   Call Side: Buy Near (+8%), Sell Far (+33%) -> Bull Call Spread (Debit)
+        #   Put Side: Buy Far (-15%), Sell Near (-8%) -> Bull Put Spread (Credit)
+        #   Call Side: Buy Near (+8%), Sell Far (+15%) -> Bull Call Spread (Debit)
         #   Result: Net Bullish Bias.
         
         legs = []
@@ -254,38 +254,38 @@ def analyze_custom_strategy(ticker, sentiment, volatility_high):
         
         if sentiment == "Bullish":
             if not volatility_high: # < 10% Move
-                # Logic: Buy P(-33%), Sell P(-8%), Buy C(+8%), Sell C(+33%)
+                # Logic: Buy P(-15%), Sell P(-8%), Buy C(+8%), Sell C(+15%)
                 legs = [
-                    {"type": "Put", "action": "Buy", "row": put_far, "desc": "Far OTM Put (-33%)"},
+                    {"type": "Put", "action": "Buy", "row": put_far, "desc": "Far OTM Put (-15%)"},
                     {"type": "Put", "action": "Sell", "row": put_near, "desc": "Near OTM Put (-8%)"},
                     {"type": "Call", "action": "Buy", "row": call_near, "desc": "Near OTM Call (+8%)"},
-                    {"type": "Call", "action": "Sell", "row": call_far, "desc": "Far OTM Call (+33%)"},
+                    {"type": "Call", "action": "Sell", "row": call_far, "desc": "Far OTM Call (+15%)"},
                 ]
             else: # > 10% Move (Opposite)
-                # Logic: Sell P(-33%), Buy P(-8%), Sell C(+8%), Buy C(+33%)
+                # Logic: Sell P(-15%), Buy P(-8%), Sell C(+8%), Buy C(+15%)
                 legs = [
-                    {"type": "Put", "action": "Sell", "row": put_far, "desc": "Far OTM Put (-33%)"},
+                    {"type": "Put", "action": "Sell", "row": put_far, "desc": "Far OTM Put (-15%)"},
                     {"type": "Put", "action": "Buy", "row": put_near, "desc": "Near OTM Put (-8%)"},
                     {"type": "Call", "action": "Sell", "row": call_near, "desc": "Near OTM Call (+8%)"},
-                    {"type": "Call", "action": "Buy", "row": call_far, "desc": "Far OTM Call (+33%)"},
+                    {"type": "Call", "action": "Buy", "row": call_far, "desc": "Far OTM Call (+15%)"},
                 ]
         else: # Bearish (Mirroring the Bullish Logic)
             if not volatility_high: # < 10% Move
                 # Mirror of Bullish/<10%:
-                # Put Side becomes Bear Put Spread (Debit): Buy Near P(-8%), Sell Far P(-33%)
-                # Call Side becomes Bear Call Spread (Credit): Sell Near C(+8%), Buy Far C(+33%)
+                # Put Side becomes Bear Put Spread (Debit): Buy Near P(-8%), Sell Far P(-15%)
+                # Call Side becomes Bear Call Spread (Credit): Sell Near C(+8%), Buy Far C(+15%)
                 legs = [
-                    {"type": "Put", "action": "Sell", "row": put_far, "desc": "Far OTM Put (-33%)"},
+                    {"type": "Put", "action": "Sell", "row": put_far, "desc": "Far OTM Put (-15%)"},
                     {"type": "Put", "action": "Buy", "row": put_near, "desc": "Near OTM Put (-8%)"},
                     {"type": "Call", "action": "Sell", "row": call_near, "desc": "Near OTM Call (+8%)"},
-                    {"type": "Call", "action": "Buy", "row": call_far, "desc": "Far OTM Call (+33%)"},
+                    {"type": "Call", "action": "Buy", "row": call_far, "desc": "Far OTM Call (+15%)"},
                 ]
             else: # > 10% Move (Opposite of Bearish/<10%)
                 legs = [
-                    {"type": "Put", "action": "Buy", "row": put_far, "desc": "Far OTM Put (-33%)"},
+                    {"type": "Put", "action": "Buy", "row": put_far, "desc": "Far OTM Put (-15%)"},
                     {"type": "Put", "action": "Sell", "row": put_near, "desc": "Near OTM Put (-8%)"},
                     {"type": "Call", "action": "Buy", "row": call_near, "desc": "Near OTM Call (+8%)"},
-                    {"type": "Call", "action": "Sell", "row": call_far, "desc": "Far OTM Call (+33%)"},
+                    {"type": "Call", "action": "Sell", "row": call_far, "desc": "Far OTM Call (+15%)"},
                 ]
 
         # 4. Calculate Financials
@@ -435,7 +435,7 @@ def main():
         
         st.info(f"""
         **Strategy Logic:**
-        - **Strikes:** Targets -33%, -8%, +8%, +33% relative to Spot Price.
+        - **Strikes:** Targets -15%, -8%, +8%, +15% relative to Spot Price.
         - **Structure:** Adapts leg direction (Buy/Sell) based on {sentiment} sentiment and {'High' if is_high_vol else 'Low'} Volatility expectation.
         """)
 
