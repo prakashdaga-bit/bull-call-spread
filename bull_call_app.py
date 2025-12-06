@@ -79,7 +79,7 @@ class StockData:
     days_to_earnings: int
 
 # ==========================================
-# 3. STRATEGY ENGINES
+# 3. ADVANCED STRATEGY ENGINES (Constraint Based)
 # ==========================================
 
 class StrategyBase:
@@ -298,17 +298,13 @@ class LongStraddleStrategy(StrategyBase):
         ]
         
         # Find ATM options (closest to stock price, or Delta ~0.50)
-        # Using simple distance to spot price here
-        
         candidates = [o for o in valid_expiry if o.open_interest >= self.config.min_open_interest]
         if not candidates:
             self.log("❌ FAIL: No liquid options found")
             return None
             
-        # Sort by distance from spot price
         closest_strike = min(candidates, key=lambda x: abs(x.strike - stock.price)).strike
         
-        # Get the Call and Put at this strike
         atm_call = next((o for o in candidates if o.strike == closest_strike and o.option_type == 'call'), None)
         atm_put = next((o for o in candidates if o.strike == closest_strike and o.option_type == 'put'), None)
         
@@ -324,16 +320,12 @@ class LongStraddleStrategy(StrategyBase):
         lp = legs['long_put']
         stock_price = legs['stock_price']
         
-        # Cost = Call Price + Put Price
         debit = lc.mid_price + lp.mid_price
         debit = round(debit, 2)
         
-        # Breakevens
         be_upper = lc.strike + debit
         be_lower = lp.strike - debit
         
-        # Constraint: Cost Efficiency
-        # If the straddle costs 20% of the stock price, it's very hard to win.
         cost_pct = debit / stock_price
         if cost_pct > self.config.max_cost_pct:
             self.log(f"⛔ ABORT: Cost ${debit} is {cost_pct:.1%} of Stock Price (Max {self.config.max_cost_pct:.1%})")
@@ -349,42 +341,77 @@ class LongStraddleStrategy(StrategyBase):
         }
 
 # ==========================================
-# 4. STREAMLIT UI IMPLEMENTATION
+# 4. SIMPLE ANALYSIS ENGINES (No Constraints)
+# ==========================================
+
+def run_simple_bull_call(stock, chain, target_long_delta=0.55, width=5):
+    """Simple calculation without Volume/IV/Risk checks."""
+    # Find closest Call to Long Delta
+    calls = [o for o in chain if o.option_type == 'call']
+    if not calls: return None
+    
+    long_call = min(calls, key=lambda x: abs(x.delta - target_long_delta))
+    target_short_strike = long_call.strike + width
+    
+    # Find Short Call (exact strike or closest)
+    short_call = min(calls, key=lambda x: abs(x.strike - target_short_strike))
+    
+    debit = long_call.mid_price - short_call.mid_price
+    max_profit = (short_call.strike - long_call.strike) - debit
+    
+    return {
+        "strikes": f"Buy {long_call.strike} / Sell {short_call.strike}",
+        "debit": round(debit, 2),
+        "max_profit": round(max_profit, 2),
+        "breakeven": round(long_call.strike + debit, 2)
+    }
+
+def run_simple_straddle(stock, chain):
+    """Simple calculation: Buy ATM Call & Put."""
+    # Find ATM Strike
+    closest_strike = min(chain, key=lambda x: abs(x.strike - stock.price)).strike
+    
+    call = next((o for o in chain if o.strike == closest_strike and o.option_type == 'call'), None)
+    put = next((o for o in chain if o.strike == closest_strike and o.option_type == 'put'), None)
+    
+    if not call or not put: return None
+    
+    debit = call.mid_price + put.mid_price
+    
+    return {
+        "strikes": f"Buy {closest_strike} Call & Put",
+        "debit": round(debit, 2),
+        "upper_be": round(closest_strike + debit, 2),
+        "lower_be": round(closest_strike - debit, 2)
+    }
+
+
+# ==========================================
+# 5. STREAMLIT UI IMPLEMENTATION
 # ==========================================
 
 def generate_mock_chain(ticker, spot_price, expiry_days, is_high_iv=False):
     """Helper to generate a fake option chain for testing logic."""
     chain = []
-    # Volatility scalar (Higher IV = Higher prices)
     vol_factor = 0.05 if is_high_iv else 0.02
-    
-    # Generate strikes around spot
-    strikes = [spot_price + i*5 for i in range(-10, 11)] # +/- $50 range
+    strikes = [spot_price + i*5 for i in range(-10, 11)] 
     
     for strike in strikes:
-        # Crude Delta Approximation
         moneyness = (spot_price - strike) / spot_price
-        
-        # Call Delta
         call_delta = 0.5 + (moneyness * 2)
         call_delta = max(0.01, min(0.99, call_delta))
-        
-        # Put Delta
         put_delta = call_delta - 1.0
         
-        # Price approximation
         dist = abs(spot_price - strike)
         base_premium = (spot_price * vol_factor) - (dist * 0.1)
         base_premium = max(0.05, base_premium)
         
-        # Calls
         chain.append(OptionContract(
             symbol=ticker, strike=strike, option_type='call', expiry_days=expiry_days,
             bid=round(base_premium, 2), ask=round(base_premium*1.1, 2),
             delta=round(call_delta, 2), open_interest=random.randint(100, 10000)
         ))
         
-        # Puts
         chain.append(OptionContract(
             symbol=ticker, strike=strike, option_type='put', expiry_days=expiry_days,
             bid=round(base_premium, 2), ask=round(base_premium*1.1, 2),
@@ -394,136 +421,130 @@ def generate_mock_chain(ticker, spot_price, expiry_days, is_high_iv=False):
 
 def main():
     st.set_page_config(page_title="Algo Options Strategy", layout="wide")
-    st.title("🛡️ Automated Options Strategy Analyzer")
-    st.markdown("Use this tool to validate if a trade meets your strict **Algorithmic Criteria**.")
-
-    # --- SIDEBAR: STRATEGY CONFIG ---
-    st.sidebar.header("Strategy Settings")
-    strategy_choice = st.sidebar.selectbox("Select Strategy", ["Iron Condor", "Bull Call Spread", "Long Straddle"])
-
-    config = None
-    if strategy_choice == "Iron Condor":
-        st.sidebar.subheader("Iron Condor Constraints")
-        min_iv = st.sidebar.number_input("Min IV Rank", value=50, step=5)
-        target_delta = st.sidebar.slider("Target Delta (Short Legs)", 0.10, 0.30, 0.16, 0.01)
-        min_credit_ratio = st.sidebar.slider("Min Credit/Width Ratio", 0.20, 0.50, 0.33, 0.01)
-        min_pop = st.sidebar.slider("Min Prob. of Profit", 0.50, 0.90, 0.60, 0.05)
-        
-        config = IronCondorConfig(
-            min_daily_volume=1000000, min_open_interest=500, min_iv_rank=min_iv,
-            avoid_earnings=True, target_dte_min=30, target_dte_max=45,
-            target_delta=target_delta, delta_tolerance=0.04,
-            min_credit_to_width_ratio=min_credit_ratio, min_pop=min_pop, min_ror=0.15
-        )
-    elif strategy_choice == "Bull Call Spread":
-        st.sidebar.subheader("Bull Call Constraints")
-        max_iv = st.sidebar.number_input("Max IV Rank (Buy Low Vol)", value=50, step=5)
-        long_delta = st.sidebar.slider("Long Call Delta", 0.40, 0.80, 0.55, 0.05)
-        short_delta = st.sidebar.slider("Short Call Delta", 0.10, 0.40, 0.30, 0.05)
-        
-        config = BullCallSpreadConfig(
-            min_daily_volume=1000000, min_open_interest=500, max_iv_rank=max_iv,
-            target_dte_min=45, target_dte_max=90, long_call_delta=long_delta,
-            short_call_delta=short_delta, delta_tolerance=0.05,
-            max_debit_to_width_ratio=0.50, min_profit_to_risk_ratio=1.0
-        )
+    st.title("🛡️ Options Strategy Analyzer")
+    
+    # --- TOP LEVEL MODE SELECTION ---
+    mode = st.sidebar.radio("Analysis Mode", ["Simple Analysis", "Constraint-Based Algo"], index=1)
+    
+    st.markdown(f"**Current Mode:** {mode}")
+    if mode == "Constraint-Based Algo":
+        st.markdown("> *Strict logic, checks IV, Volume, Earnings, and Profitability Constraints.*")
     else:
-        st.sidebar.subheader("Long Straddle Constraints")
-        max_iv = st.sidebar.number_input("Max IV Rank (Cheap Premium)", value=40, step=5)
-        max_cost = st.sidebar.slider("Max Cost (% of Stock Price)", 0.02, 0.15, 0.08, 0.01)
-        
-        config = LongStraddleConfig(
-            min_daily_volume=1000000, min_open_interest=500, max_iv_rank=max_iv,
-            target_dte_min=14, target_dte_max=60, delta_tolerance=0.10,
-            max_cost_pct=max_cost
-        )
+        st.markdown("> *Basic math only. Calculates P&L for standard structures. No filtering.*")
 
-    # --- MAIN AREA: TICKER INPUT ---
+    # --- SHARED INPUTS ---
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         ticker = st.text_input("Ticker Symbol", "TSLA").upper()
     with col2:
         price = st.number_input("Current Price", value=250.0)
     with col3:
-        iv_rank = st.number_input("Current IV Rank", value=65.0)
+        # IV only matters for Algo, but used for mock data generation in both
+        iv_rank = st.number_input("IV Rank (0-100)", value=65.0) 
     with col4:
         earnings_days = st.number_input("Days to Earnings", value=60)
 
-    # --- GENERATE DATA & RUN ---
-    if st.button("Run Algorithmic Analysis", type="primary"):
-        # 1. Create Data Objects
-        stock_data = StockData(ticker, price, 50000000, iv_rank, earnings_days)
+    # --- MODE SPECIFIC LOGIC ---
+    
+    if mode == "Simple Analysis":
+        # SIMPLE MODE UI
+        simple_strat = st.selectbox("Select Strategy", ["Bull Call Spread", "Long Straddle"])
         
-        # 2. Mock Option Chain (Since we don't have an API here)
-        # If IV is high, prices are higher.
-        is_high_iv = iv_rank > 50
-        expiry_days = 35 if strategy_choice == "Iron Condor" else 60
-        chain = generate_mock_chain(ticker, price, expiry_days, is_high_iv)
-        
-        st.info(f"Generated {len(chain)} mock contracts for {ticker} (Expiry: {expiry_days} days)")
-
-        # 3. Initialize Strategy
-        if strategy_choice == "Iron Condor":
-            algo = IronCondorStrategy(config)
-        elif strategy_choice == "Bull Call Spread":
-            algo = BullCallSpreadStrategy(config)
-        else:
-            algo = LongStraddleStrategy(config)
-
-        # 4. Execute Logic
-        col_log, col_res = st.columns([1, 1])
-        
-        with col_log:
-            st.subheader("Algorithmic Decision Log")
+        if st.button("Calculate P&L"):
+            # Mock Data
+            chain = generate_mock_chain(ticker, price, 45, iv_rank > 50)
+            stock_data = StockData(ticker, price, 50000000, iv_rank, earnings_days)
             
-            # Phase 1
-            passed_filters = algo.check_filters(stock_data)
-            
-            legs = None
-            if passed_filters:
-                # Phase 2
-                legs = algo.find_strikes(stock_data, chain)
-            
-            result = None
-            if legs:
-                # Phase 3
-                result = algo.validate_trade(legs)
-            
-            # Print Logs
-            for log in algo.logs:
-                if "FAIL" in log or "ABORT" in log:
-                    st.error(log)
-                else:
-                    st.success(log)
-
-        with col_res:
-            st.subheader("Final Recommendation")
-            if result:
-                st.balloons()
-                st.success(f"✅ TRADE APPROVED: {result['type']}")
-                st.markdown(f"**Structure:** `{result['strikes']}`")
-                
-                m1, m2, m3 = st.columns(3)
-                if 'credit' in result:
-                    m1.metric("Credit Received", f"${result['credit']}")
-                    m2.metric("Max Risk", f"${result['max_risk']}")
-                    m3.metric("POP", f"{result['pop']:.1%}")
-                elif 'breakevens' in result:
-                    m1.metric("Total Debit", f"${result['debit']}")
-                    m2.metric("Cost %", result['cost_pct'])
-                    m3.metric("Breakevens", "See Below")
-                    st.info(f"Breakevens: {result['breakevens']}")
-                else:
-                    m1.metric("Debit Paid", f"${result['debit']}")
-                    m2.metric("Max Profit", f"${result['max_profit']}")
-                    m3.metric("Risk/Reward", f"{result['risk_reward']}")
-
-            elif not passed_filters:
-                st.warning("🚫 Trade Rejected at Phase 1 (Filters)")
-            elif not legs:
-                st.warning("🚫 Trade Rejected at Phase 2 (Geometry/Strikes)")
+            if simple_strat == "Bull Call Spread":
+                res = run_simple_bull_call(stock_data, chain)
+                if res:
+                    st.success(f"📈 {simple_strat} Setup")
+                    st.write(f"**Structure:** {res['strikes']}")
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Debit Paid", f"${res['debit']}")
+                    c2.metric("Max Profit", f"${res['max_profit']}")
+                    c3.metric("Breakeven", f"${res['breakeven']}")
             else:
-                st.warning("🚫 Trade Rejected at Phase 3 (Risk Constraints)")
+                res = run_simple_straddle(stock_data, chain)
+                if res:
+                    st.success(f"💥 {simple_strat} Setup")
+                    st.write(f"**Structure:** {res['strikes']}")
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Total Cost", f"${res['debit']}")
+                    c2.metric("Lower Breakeven", f"${res['lower_be']}")
+                    c3.metric("Upper Breakeven", f"${res['upper_be']}")
+
+    else:
+        # CONSTRAINT-BASED ALGO UI (Original Logic)
+        st.sidebar.markdown("---")
+        strategy_choice = st.sidebar.selectbox("Algo Strategy", ["Iron Condor", "Bull Call Spread", "Long Straddle"])
+
+        config = None
+        if strategy_choice == "Iron Condor":
+            st.sidebar.subheader("Iron Condor Settings")
+            min_iv = st.sidebar.number_input("Min IV Rank", value=50, step=5)
+            target_delta = st.sidebar.slider("Target Delta", 0.10, 0.30, 0.16, 0.01)
+            min_pop = st.sidebar.slider("Min POP", 0.50, 0.90, 0.60, 0.05)
+            
+            config = IronCondorConfig(
+                min_daily_volume=1000000, min_open_interest=500, min_iv_rank=min_iv,
+                avoid_earnings=True, target_dte_min=30, target_dte_max=45,
+                target_delta=target_delta, delta_tolerance=0.04,
+                min_credit_to_width_ratio=0.33, min_pop=min_pop, min_ror=0.15
+            )
+        elif strategy_choice == "Bull Call Spread":
+            st.sidebar.subheader("Bull Call Settings")
+            max_iv = st.sidebar.number_input("Max IV Rank", value=50, step=5)
+            config = BullCallSpreadConfig(
+                min_daily_volume=1000000, min_open_interest=500, max_iv_rank=max_iv,
+                target_dte_min=45, target_dte_max=90, long_call_delta=0.55,
+                short_call_delta=0.30, delta_tolerance=0.05,
+                max_debit_to_width_ratio=0.50, min_profit_to_risk_ratio=1.0
+            )
+        else:
+            st.sidebar.subheader("Straddle Settings")
+            max_iv = st.sidebar.number_input("Max IV Rank", value=40, step=5)
+            config = LongStraddleConfig(
+                min_daily_volume=1000000, min_open_interest=500, max_iv_rank=max_iv,
+                target_dte_min=14, target_dte_max=60, delta_tolerance=0.10,
+                max_cost_pct=0.10
+            )
+
+        if st.button("Run Algo Analysis", type="primary"):
+            stock_data = StockData(ticker, price, 50000000, iv_rank, earnings_days)
+            expiry = 35 if strategy_choice == "Iron Condor" else 60
+            chain = generate_mock_chain(ticker, price, expiry, iv_rank > 50)
+            
+            # Init Algo
+            if strategy_choice == "Iron Condor": algo = IronCondorStrategy(config)
+            elif strategy_choice == "Bull Call Spread": algo = BullCallSpreadStrategy(config)
+            else: algo = LongStraddleStrategy(config)
+
+            # Execution
+            col_log, col_res = st.columns([1, 1])
+            with col_log:
+                st.subheader("Decision Log")
+                passed = algo.check_filters(stock_data)
+                legs = algo.find_strikes(stock_data, chain) if passed else None
+                result = algo.validate_trade(legs) if legs else None
+                
+                for log in algo.logs:
+                    if "FAIL" in log or "ABORT" in log: st.error(log)
+                    else: st.success(log)
+            
+            with col_res:
+                st.subheader("Recommendation")
+                if result:
+                    st.balloons()
+                    st.success(f"✅ APPROVED: {result['type']}")
+                    st.markdown(f"**{result['strikes']}**")
+                    # Display metrics based on strategy type
+                    if 'credit' in result: st.metric("Credit", f"${result['credit']}")
+                    elif 'debit' in result: st.metric("Debit", f"${result['debit']}")
+
+                elif not passed: st.warning("Rejected at Filters")
+                elif not legs: st.warning("Rejected at Strike Selection")
+                else: st.warning("Rejected at Constraints")
 
 if __name__ == "__main__":
     main()
