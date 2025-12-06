@@ -341,53 +341,7 @@ class LongStraddleStrategy(StrategyBase):
         }
 
 # ==========================================
-# 4. SIMPLE ANALYSIS ENGINES (No Constraints)
-# ==========================================
-
-def run_simple_bull_call(stock, chain, target_long_delta=0.55, width=5):
-    """Simple calculation without Volume/IV/Risk checks."""
-    # Find closest Call to Long Delta
-    calls = [o for o in chain if o.option_type == 'call']
-    if not calls: return None
-    
-    long_call = min(calls, key=lambda x: abs(x.delta - target_long_delta))
-    target_short_strike = long_call.strike + width
-    
-    # Find Short Call (exact strike or closest)
-    short_call = min(calls, key=lambda x: abs(x.strike - target_short_strike))
-    
-    debit = long_call.mid_price - short_call.mid_price
-    max_profit = (short_call.strike - long_call.strike) - debit
-    
-    return {
-        "strikes": f"Buy {long_call.strike} / Sell {short_call.strike}",
-        "debit": round(debit, 2),
-        "max_profit": round(max_profit, 2),
-        "breakeven": round(long_call.strike + debit, 2)
-    }
-
-def run_simple_straddle(stock, chain):
-    """Simple calculation: Buy ATM Call & Put."""
-    # Find ATM Strike
-    closest_strike = min(chain, key=lambda x: abs(x.strike - stock.price)).strike
-    
-    call = next((o for o in chain if o.strike == closest_strike and o.option_type == 'call'), None)
-    put = next((o for o in chain if o.strike == closest_strike and o.option_type == 'put'), None)
-    
-    if not call or not put: return None
-    
-    debit = call.mid_price + put.mid_price
-    
-    return {
-        "strikes": f"Buy {closest_strike} Call & Put",
-        "debit": round(debit, 2),
-        "upper_be": round(closest_strike + debit, 2),
-        "lower_be": round(closest_strike - debit, 2)
-    }
-
-
-# ==========================================
-# 5. STREAMLIT UI IMPLEMENTATION
+# 4. STREAMLIT UI IMPLEMENTATION
 # ==========================================
 
 def generate_mock_chain(ticker, spot_price, expiry_days, is_high_iv=False):
@@ -424,13 +378,13 @@ def main():
     st.title("🛡️ Options Strategy Analyzer")
     
     # --- TOP LEVEL MODE SELECTION ---
-    mode = st.sidebar.radio("Analysis Mode", ["Simple Analysis", "Constraint-Based Algo"], index=1)
+    mode = st.sidebar.radio("Analysis Mode", ["Manual Calculator (Simple)", "Algo Strategy (Constraint-Based)"], index=1)
     
     st.markdown(f"**Current Mode:** {mode}")
-    if mode == "Constraint-Based Algo":
-        st.markdown("> *Strict logic, checks IV, Volume, Earnings, and Profitability Constraints.*")
+    if mode == "Algo Strategy (Constraint-Based)":
+        st.markdown("> *Strict logic. Checks IV, Volume, Earnings, and Profitability Constraints. Finds strikes for you.*")
     else:
-        st.markdown("> *Basic math only. Calculates P&L for standard structures. No filtering.*")
+        st.markdown("> *Manual Calculator. You enter the strikes and prices. The script calculates Profit, Loss, and Breakevens.*")
 
     # --- SHARED INPUTS ---
     col1, col2, col3, col4 = st.columns(4)
@@ -446,33 +400,58 @@ def main():
 
     # --- MODE SPECIFIC LOGIC ---
     
-    if mode == "Simple Analysis":
-        # SIMPLE MODE UI
-        simple_strat = st.selectbox("Select Strategy", ["Bull Call Spread", "Long Straddle"])
+    if mode == "Manual Calculator (Simple)":
+        # SIMPLE MODE UI - Reverted to Manual Input style
+        st.sidebar.markdown("---")
+        simple_strat = st.sidebar.selectbox("Calculator Type", ["Bull Call Spread", "Long Straddle"])
         
-        if st.button("Calculate P&L"):
-            # Mock Data
-            chain = generate_mock_chain(ticker, price, 45, iv_rank > 50)
-            stock_data = StockData(ticker, price, 50000000, iv_rank, earnings_days)
+        if simple_strat == "Bull Call Spread":
+            st.subheader("📈 Bull Call Spread Calculator")
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                buy_strike = st.number_input("Buy Call Strike", value=250.0)
+            with c2:
+                sell_strike = st.number_input("Sell Call Strike", value=255.0)
+            with c3:
+                net_debit = st.number_input("Net Debit Paid ($)", value=2.00)
             
-            if simple_strat == "Bull Call Spread":
-                res = run_simple_bull_call(stock_data, chain)
-                if res:
-                    st.success(f"📈 {simple_strat} Setup")
-                    st.write(f"**Structure:** {res['strikes']}")
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("Debit Paid", f"${res['debit']}")
-                    c2.metric("Max Profit", f"${res['max_profit']}")
-                    c3.metric("Breakeven", f"${res['breakeven']}")
-            else:
-                res = run_simple_straddle(stock_data, chain)
-                if res:
-                    st.success(f"💥 {simple_strat} Setup")
-                    st.write(f"**Structure:** {res['strikes']}")
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("Total Cost", f"${res['debit']}")
-                    c2.metric("Lower Breakeven", f"${res['lower_be']}")
-                    c3.metric("Upper Breakeven", f"${res['upper_be']}")
+            if st.button("Calculate Result"):
+                width = sell_strike - buy_strike
+                max_profit = width - net_debit
+                breakeven = buy_strike + net_debit
+                
+                # Validation
+                if buy_strike >= sell_strike:
+                    st.error("Error: Buy Strike must be lower than Sell Strike.")
+                else:
+                    st.success("Analysis Complete")
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("Max Risk (Debit)", f"${net_debit:.2f}")
+                    m2.metric("Max Profit", f"${max_profit:.2f}")
+                    m3.metric("Breakeven Price", f"${breakeven:.2f}")
+                    
+                    st.info(f"You are risking ${net_debit} to make ${max_profit}. Risk/Reward Ratio: 1 : {(max_profit/net_debit):.2f}")
+
+        else: # Long Straddle
+            st.subheader("💥 Long Straddle Calculator")
+            c1, c2 = st.columns(2)
+            with c1:
+                strike = st.number_input("Strike Price (ATM)", value=250.0)
+            with c2:
+                total_cost = st.number_input("Total Cost (Call + Put)", value=15.00)
+                
+            if st.button("Calculate Result"):
+                upper_be = strike + total_cost
+                lower_be = strike - total_cost
+                
+                st.success("Analysis Complete")
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Max Risk", f"${total_cost:.2f}")
+                m2.metric("Lower Breakeven", f"${lower_be:.2f}")
+                m3.metric("Upper Breakeven", f"${upper_be:.2f}")
+                
+                move_needed = (total_cost / strike) * 100
+                st.info(f"Stock needs to move {move_needed:.1f}% in either direction to profit.")
 
     else:
         # CONSTRAINT-BASED ALGO UI (Original Logic)
