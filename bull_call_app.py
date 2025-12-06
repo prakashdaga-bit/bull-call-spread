@@ -14,13 +14,16 @@ from typing import List, Optional, Dict, Union
 st.set_page_config(page_title="Options Strategy Master", page_icon="📈", layout="wide")
 
 # ==========================================
-# PART 1: SIMPLE ANALYSIS LOGIC (From bull_call_app.py)
-# Uses yfinance for Real Data
+# SHARED HELPER FUNCTIONS (Real Data)
 # ==========================================
 
 def get_monthly_expirations(ticker_obj, limit=3):
     """Filters the list of expiration dates to find the next 'limit' distinct months."""
-    expirations = ticker_obj.options
+    try:
+        expirations = ticker_obj.options
+    except:
+        return []
+        
     if not expirations:
         return []
     dates = [datetime.datetime.strptime(date, '%Y-%m-%d') for date in expirations]
@@ -53,10 +56,23 @@ def find_closest_strike(chain, price_target):
     chain['abs_diff'] = (chain['strike'] - price_target).abs()
     return chain.sort_values('abs_diff').iloc[0]
 
-def get_price(option_row, price_type='ask'):
-    price = option_row.get(price_type, 0)
-    if price == 0: return option_row.get('lastPrice', 0)
-    return price
+def get_price(option_row, price_type='mid'):
+    """
+    Returns the price for the option.
+    price_type: 'ask' (buying), 'bid' (selling), or 'mid' (valuing)
+    """
+    bid = option_row.get('bid', 0)
+    ask = option_row.get('ask', 0)
+    last = option_row.get('lastPrice', 0)
+    
+    if price_type == 'mid':
+        if bid > 0 and ask > 0: return (bid + ask) / 2
+        return last
+    elif price_type == 'ask':
+        return ask if ask > 0 else last
+    elif price_type == 'bid':
+        return bid if bid > 0 else (last * 0.95) # Fallback if no bid
+    return last
 
 def get_option_chain_with_retry(stock, date, retries=3):
     for i in range(retries):
@@ -66,6 +82,10 @@ def get_option_chain_with_retry(stock, date, retries=3):
             if i == retries - 1: raise e
             time.sleep((2 ** (i + 1)) + random.uniform(0.5, 1.5))
     return None
+
+# ==========================================
+# PART 1: SIMPLE ANALYSIS LOGIC
+# ==========================================
 
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_and_analyze_ticker(ticker_symbol, strategy_type):
@@ -168,158 +188,169 @@ def fetch_and_analyze_ticker(ticker_symbol, strategy_type):
 
 
 # ==========================================
-# PART 2: CONSTRAINT ALGO LOGIC (Iron Condor Algo)
-# Uses Mock Data / Logic Classes
+# PART 2: CUSTOM 4-LEG STRATEGY (REAL DATA)
 # ==========================================
 
-@dataclass
-class IronCondorConfig:
-    min_daily_volume: int
-    min_open_interest: int
-    min_iv_rank: float
-    avoid_earnings: bool
-    target_dte_min: int
-    target_dte_max: int
-    target_delta: float
-    delta_tolerance: float
-    min_credit_to_width_ratio: float
-    min_pop: float
-    min_ror: float
-
-@dataclass
-class BullCallSpreadConfig:
-    min_daily_volume: int
-    min_open_interest: int
-    max_iv_rank: float
-    target_dte_min: int
-    target_dte_max: int
-    long_call_delta: float
-    short_call_delta: float
-    delta_tolerance: float
-    max_debit_to_width_ratio: float
-    min_profit_to_risk_ratio: float
-
-@dataclass
-class LongStraddleConfig:
-    min_daily_volume: int
-    min_open_interest: int
-    max_iv_rank: float 
-    target_dte_min: int
-    target_dte_max: int
-    delta_tolerance: float 
-    max_cost_pct: float    
-
-@dataclass
-class OptionContract:
-    symbol: str; strike: float; option_type: str; expiry_days: int
-    bid: float; ask: float; delta: float; open_interest: int
-    @property
-    def mid_price(self): return round((self.bid + self.ask) / 2, 2)
-
-@dataclass
-class StockData:
-    symbol: str; price: float; avg_daily_volume: int; iv_rank: float; days_to_earnings: int
-
-class StrategyBase:
-    def __init__(self): self.logs = []
-    def log(self, msg): self.logs.append(msg)
-
-class IronCondorStrategy(StrategyBase):
-    def __init__(self, config: IronCondorConfig):
-        super().__init__(); self.config = config
-    def check_filters(self, stock: StockData) -> bool:
-        if stock.avg_daily_volume < self.config.min_daily_volume: self.log(f"❌ FAIL: Low Volume"); return False
-        if stock.iv_rank < self.config.min_iv_rank: self.log(f"❌ FAIL: Low IV Rank"); return False
-        if self.config.avoid_earnings and stock.days_to_earnings < self.config.target_dte_max: self.log(f"❌ FAIL: Earnings Imminent"); return False
-        self.log("✅ Phase 1: Universe Filters Passed"); return True
-    def find_strikes(self, stock: StockData, chain: List[OptionContract]):
-        valid = [o for o in chain if self.config.target_dte_min <= o.expiry_days <= self.config.target_dte_max]
-        if not valid: self.log("❌ FAIL: No DTE match"); return None
-        wing_width = 10.0 if stock.price > 200 else 5.0
-        def get_leg(target_delta, type_):
-            cands = [o for o in valid if o.option_type == type_ and o.open_interest >= self.config.min_open_interest]
-            if not cands: return None
-            best = min(cands, key=lambda x: abs(abs(x.delta) - abs(target_delta)))
-            return best if abs(abs(best.delta) - abs(target_delta)) <= self.config.delta_tolerance else None
-        
-        sp = get_leg(-self.config.target_delta, 'put')
-        sc = get_leg(self.config.target_delta, 'call')
-        if not sp or not sc: self.log("❌ FAIL: No Short Legs"); return None
-        
-        lp = next((o for o in valid if o.option_type == 'put' and o.strike == sp.strike - wing_width), None)
-        lc = next((o for o in valid if o.option_type == 'call' and o.strike == sc.strike + wing_width), None)
-        if not lp or not lc: self.log("❌ FAIL: No Wings"); return None
-        
-        self.log(f"✅ Phase 2: Geometry Found (Width ${wing_width})"); 
-        return {"short_put": sp, "long_put": lp, "short_call": sc, "long_call": lc, "width": wing_width}
+@st.cache_data(ttl=300, show_spinner=False)
+def analyze_custom_strategy(ticker, sentiment, volatility_high):
+    """
+    Constructs a 4-leg strategy based on specific strike percentages using Real Data.
     
-    def validate_trade(self, legs):
-        sp, lp, sc, lc, width = legs['short_put'], legs['long_put'], legs['short_call'], legs['long_call'], legs['width']
-        credit = round((sp.mid_price + sc.mid_price) - (lp.mid_price + lc.mid_price), 2)
-        max_risk = width - credit
-        pop = 1.0 - (abs(sc.delta) + abs(sp.delta))
+    Logic:
+    1. Fetch real price and chain.
+    2. Determine Strikes: -33%, -8%, +8%, +33%.
+    3. Determine Action (Buy/Sell) based on Sentiment & Volatility.
+    """
+    try:
+        # 1. Fetch Data
+        stock = yf.Ticker(ticker)
+        try:
+            current_price = stock.fast_info['last_price']
+        except:
+            hist = stock.history(period='1d')
+            if hist.empty: return None, "No price data found."
+            current_price = hist['Close'].iloc[-1]
+            
+        # Get next valid monthly expiration (approx 30 days out)
+        dates = get_monthly_expirations(stock, limit=2)
+        if not dates: return None, "No option chain found."
         
-        if (credit / width) < self.config.min_credit_to_width_ratio: self.log(f"⛔ ABORT: Low Credit"); return None
-        if pop < self.config.min_pop: self.log(f"⛔ ABORT: Low POP"); return None
-        if (credit / max_risk) < self.config.min_ror: self.log(f"⛔ ABORT: Low ROR"); return None
-        return {"type": "Iron Condor", "strikes": f"P:{lp.strike}/{sp.strike} | C:{sc.strike}/{lc.strike}", "credit": credit, "max_risk": round(max_risk, 2), "pop": pop}
+        # Prefer the second month if available (more time for strategy), else first
+        target_date = dates[0] 
+        
+        chain = get_option_chain_with_retry(stock, target_date)
+        calls = filter_tradeable_options(chain.calls)
+        puts = filter_tradeable_options(chain.puts)
+        
+        if calls.empty or puts.empty: return None, "Chain data incomplete (missing calls or puts)."
 
-class BullCallSpreadStrategy(StrategyBase):
-    def __init__(self, config: BullCallSpreadConfig):
-        super().__init__(); self.config = config
-    def check_filters(self, stock: StockData) -> bool:
-        if stock.iv_rank > self.config.max_iv_rank: self.log(f"❌ FAIL: High IV"); return False
-        self.log("✅ Phase 1: Filters Passed"); return True
-    def find_strikes(self, stock: StockData, chain: List[OptionContract]):
-        valid = [o for o in chain if self.config.target_dte_min <= o.expiry_days <= self.config.target_dte_max]
-        def get_leg(delta_target):
-            cands = [o for o in valid if o.option_type == 'call' and o.open_interest >= self.config.min_open_interest]
-            if not cands: return None
-            best = min(cands, key=lambda x: abs(x.delta - delta_target))
-            return best if abs(best.delta - delta_target) <= self.config.delta_tolerance else None
-        lc = get_leg(self.config.long_call_delta)
-        sc = get_leg(self.config.short_call_delta)
-        if not lc or not sc or lc.strike >= sc.strike: self.log("❌ FAIL: Strike Issues"); return None
-        self.log("✅ Phase 2: Geometry Found"); return {"long_call": lc, "short_call": sc}
-    def validate_trade(self, legs):
-        lc, sc = legs['long_call'], legs['short_call']
-        width = sc.strike - lc.strike
-        debit = round(lc.mid_price - sc.mid_price, 2)
-        if (debit/width) > self.config.max_debit_to_width_ratio: self.log("⛔ ABORT: Expensive"); return None
-        return {"type": "Bull Call Spread", "strikes": f"Buy {lc.strike} / Sell {sc.strike}", "debit": debit, "max_profit": width - debit}
+        # 2. Identify Strikes
+        # Targets: -33% (0.67), -8% (0.92), +8% (1.08), +33% (1.33)
+        k_put_far_target = current_price * 0.67
+        k_put_near_target = current_price * 0.92
+        k_call_near_target = current_price * 1.08
+        k_call_far_target = current_price * 1.33
+        
+        # Find actual contracts
+        put_far = find_closest_strike(puts, k_put_far_target)
+        put_near = find_closest_strike(puts, k_put_near_target)
+        call_near = find_closest_strike(calls, k_call_near_target)
+        call_far = find_closest_strike(calls, k_call_far_target)
+        
+        if any(leg is None for leg in [put_far, put_near, call_near, call_far]):
+            return None, "Could not find options at required strike depths (liquidity issue)."
+            
+        # 3. Determine Strategy Structure
+        # Default Template (<10% Move):
+        #   Put Side: Buy Far (-33%), Sell Near (-8%) -> Bull Put Spread (Credit)
+        #   Call Side: Buy Near (+8%), Sell Far (+33%) -> Bull Call Spread (Debit)
+        #   Result: Net Bullish Bias.
+        
+        legs = []
+        
+        # --- LOGIC MATRIX ---
+        # Sentiment: Bullish vs Bearish
+        # Volatility: <10% (Low) vs >10% (High)
+        
+        if sentiment == "Bullish":
+            if not volatility_high: # < 10% Move
+                # Logic: Buy P(-33%), Sell P(-8%), Buy C(+8%), Sell C(+33%)
+                legs = [
+                    {"type": "Put", "action": "Buy", "row": put_far, "desc": "Far OTM Put (-33%)"},
+                    {"type": "Put", "action": "Sell", "row": put_near, "desc": "Near OTM Put (-8%)"},
+                    {"type": "Call", "action": "Buy", "row": call_near, "desc": "Near OTM Call (+8%)"},
+                    {"type": "Call", "action": "Sell", "row": call_far, "desc": "Far OTM Call (+33%)"},
+                ]
+            else: # > 10% Move (Opposite)
+                # Logic: Sell P(-33%), Buy P(-8%), Sell C(+8%), Buy C(+33%)
+                legs = [
+                    {"type": "Put", "action": "Sell", "row": put_far, "desc": "Far OTM Put (-33%)"},
+                    {"type": "Put", "action": "Buy", "row": put_near, "desc": "Near OTM Put (-8%)"},
+                    {"type": "Call", "action": "Sell", "row": call_near, "desc": "Near OTM Call (+8%)"},
+                    {"type": "Call", "action": "Buy", "row": call_far, "desc": "Far OTM Call (+33%)"},
+                ]
+        else: # Bearish (Mirroring the Bullish Logic)
+            if not volatility_high: # < 10% Move
+                # Mirror of Bullish/<10%:
+                # Put Side becomes Bear Put Spread (Debit): Buy Near P(-8%), Sell Far P(-33%)
+                # Call Side becomes Bear Call Spread (Credit): Sell Near C(+8%), Buy Far C(+33%)
+                legs = [
+                    {"type": "Put", "action": "Sell", "row": put_far, "desc": "Far OTM Put (-33%)"},
+                    {"type": "Put", "action": "Buy", "row": put_near, "desc": "Near OTM Put (-8%)"},
+                    {"type": "Call", "action": "Sell", "row": call_near, "desc": "Near OTM Call (+8%)"},
+                    {"type": "Call", "action": "Buy", "row": call_far, "desc": "Far OTM Call (+33%)"},
+                ]
+            else: # > 10% Move (Opposite of Bearish/<10%)
+                legs = [
+                    {"type": "Put", "action": "Buy", "row": put_far, "desc": "Far OTM Put (-33%)"},
+                    {"type": "Put", "action": "Sell", "row": put_near, "desc": "Near OTM Put (-8%)"},
+                    {"type": "Call", "action": "Buy", "row": call_near, "desc": "Near OTM Call (+8%)"},
+                    {"type": "Call", "action": "Sell", "row": call_far, "desc": "Far OTM Call (+33%)"},
+                ]
 
-class LongStraddleStrategy(StrategyBase):
-    def __init__(self, config: LongStraddleConfig):
-        super().__init__(); self.config = config
-    def check_filters(self, stock: StockData) -> bool:
-        if stock.iv_rank > self.config.max_iv_rank: self.log(f"❌ FAIL: High IV"); return False
-        self.log("✅ Phase 1: Filters Passed"); return True
-    def find_strikes(self, stock: StockData, chain: List[OptionContract]):
-        valid = [o for o in chain if self.config.target_dte_min <= o.expiry_days <= self.config.target_dte_max]
-        if not valid: return None
-        closest = min(valid, key=lambda x: abs(x.strike - stock.price)).strike
-        c = next((o for o in valid if o.strike == closest and o.option_type == 'call'), None)
-        p = next((o for o in valid if o.strike == closest and o.option_type == 'put'), None)
-        if not c or not p: self.log("❌ FAIL: Missing legs"); return None
-        self.log(f"✅ Phase 2: ATM Strike {closest}"); return {"long_call": c, "long_put": p, "stock_price": stock.price}
-    def validate_trade(self, legs):
-        debit = round(legs['long_call'].mid_price + legs['long_put'].mid_price, 2)
-        if (debit / legs['stock_price']) > self.config.max_cost_pct: self.log("⛔ ABORT: Too Expensive"); return None
-        return {"type": "Long Straddle", "strikes": f"Straddle {legs['long_call'].strike}", "debit": debit, "breakevens": f"±{debit}"}
+        # 4. Calculate Financials
+        net_premium = 0.0 # Positive = Credit, Negative = Debit
+        trade_details = []
+        
+        for leg in legs:
+            strike = leg['row']['strike']
+            # Use Ask if Buying, Bid if Selling
+            price = get_price(leg['row'], 'ask' if leg['action'] == "Buy" else 'bid')
+            
+            impact = -price if leg['action'] == "Buy" else price
+            net_premium += impact
+            
+            trade_details.append({
+                "Action": leg['action'],
+                "Type": leg['type'],
+                "Strike": strike,
+                "Price": price,
+                "Description": leg['desc']
+            })
 
-def generate_mock_chain(ticker, spot_price, expiry_days, is_high_iv=False):
-    chain = []
-    vol_factor = 0.05 if is_high_iv else 0.02
-    strikes = [spot_price + i*5 for i in range(-10, 11)] 
-    for strike in strikes:
-        moneyness = (spot_price - strike) / spot_price
-        call_delta = max(0.01, min(0.99, 0.5 + (moneyness * 2)))
-        put_delta = call_delta - 1.0
-        dist = abs(spot_price - strike)
-        base_premium = max(0.05, (spot_price * vol_factor) - (dist * 0.1))
-        chain.append(OptionContract(ticker, strike, 'call', expiry_days, round(base_premium, 2), round(base_premium*1.1, 2), round(call_delta, 2), 5000))
-        chain.append(OptionContract(ticker, strike, 'put', expiry_days, round(base_premium, 2), round(base_premium*1.1, 2), round(put_delta, 2), 5000))
-    return chain
+        # 5. P&L Analysis
+        # Determine Max Profit/Loss and Breakevens
+        # We simulate P&L at expiration across a range
+        sim_prices = sorted([l['row']['strike'] for l in legs] + [current_price])
+        min_p = current_price * 0.5
+        max_p = current_price * 1.5
+        sim_range = [min_p] + sim_prices + [max_p]
+        
+        profits = []
+        for p in sim_range:
+            p_l = net_premium
+            for leg in legs:
+                strike = leg['row']['strike']
+                is_call = leg['type'] == "Call"
+                is_buy = leg['action'] == "Buy"
+                
+                val_at_expiry = max(0, p - strike) if is_call else max(0, strike - p)
+                leg_pnl = val_at_expiry if is_buy else -val_at_expiry
+                p_l += leg_pnl
+            profits.append(p_l)
+            
+        max_upside = max(profits)
+        max_loss = min(profits)
+        
+        # Heuristic for breakevens (finding zero crossings)
+        breakevens = []
+        # Simple scan
+        if min(profits) < 0 < max(profits):
+            breakevens.append("Dynamic (Depends on expiry price)")
+        else:
+            breakevens.append("None (Always Profit/Loss)" if net_premium != 0 else "Flat")
+
+        return {
+            "current_price": current_price,
+            "expiry": target_date,
+            "net_premium": net_premium,
+            "max_upside": max_upside,
+            "max_loss": max_loss,
+            "legs": trade_details
+        }, None
+
+    except Exception as e:
+        return None, str(e)
 
 # ==========================================
 # PART 3: MAIN APP INTERFACE
@@ -331,17 +362,17 @@ def main():
     # --- MASTER SWITCH ---
     mode = st.sidebar.radio(
         "Select Analysis Mode:", 
-        ["Simple Analysis (Real Data)", "Constraint-Based Algo (Simulation)"],
+        ["Simple Analysis (Standard)", "Custom Strategy Generator (Iron Condor Style)"],
         index=0
     )
     st.sidebar.markdown("---")
 
     # ==========================================
-    # MODE A: SIMPLE ANALYSIS (yfinance)
+    # MODE A: SIMPLE ANALYSIS
     # ==========================================
-    if mode == "Simple Analysis (Real Data)":
+    if mode == "Simple Analysis (Standard)":
         st.subheader("📈 Multi-Stock Real-Time Analysis")
-        st.caption("Fetches live option chains from Yahoo Finance. No filters, just math.")
+        st.caption("Fetches live option chains from Yahoo Finance. Standard Spreads/Straddles.")
         
         # Inputs
         strategy = st.radio("Strategy Type:", ("Bull Call Spread", "Long Straddle"), horizontal=True)
@@ -372,7 +403,6 @@ def main():
                 if all_summaries:
                     st.header("Summary")
                     summary_df = pd.DataFrame(all_summaries)
-                    # Reorder cols
                     cols = ["Stock"] + sorted([c for c in summary_df.columns if c != "Stock"])
                     st.dataframe(summary_df[cols], hide_index=True, use_container_width=True)
                 else:
@@ -389,80 +419,54 @@ def main():
                         for e in errors: st.write(f"- {e}")
 
     # ==========================================
-    # MODE B: CONSTRAINT ALGO (Mock Data)
+    # MODE B: CUSTOM 4-LEG STRATEGY
     # ==========================================
     else:
-        st.subheader("🤖 Algorithmic Constraint Analysis")
-        st.caption("Uses strict logical gates (IV Rank, Delta, POP, ROR) to Approve/Reject trades.")
+        st.subheader("🤖 Custom 4-Leg Strategy Generator")
+        st.caption("Constructs a 4-leg structure (Iron Condor style) based on Sentiment & Expected Move using **Real-Time Data**.")
         
-        # Sidebar Configs
-        algo_strat = st.sidebar.selectbox("Algo Strategy", ["Iron Condor", "Bull Call Spread", "Long Straddle"])
+        # 1. Inputs
+        c1, c2, c3 = st.columns(3)
+        ticker = c1.text_input("Stock Ticker", "TSLA").upper()
+        sentiment = c2.selectbox("Your Sentiment", ["Bullish", "Bearish"])
+        vol_expect = c3.selectbox("Expect >10% Move?", ["No (Range Bound / <10%)", "Yes (Breakout / >10%)"])
         
-        config = None
-        if algo_strat == "Iron Condor":
-            st.sidebar.subheader("Iron Condor Settings")
-            config = IronCondorConfig(
-                min_daily_volume=1000000, min_open_interest=500, 
-                min_iv_rank=st.sidebar.number_input("Min IV Rank", 50, 100, 50),
-                avoid_earnings=True, target_dte_min=30, target_dte_max=45,
-                target_delta=st.sidebar.slider("Target Delta", 0.1, 0.3, 0.16, 0.01),
-                delta_tolerance=0.04, min_credit_to_width_ratio=0.33,
-                min_pop=st.sidebar.slider("Min POP", 0.5, 0.9, 0.60), min_ror=0.15
-            )
-        elif algo_strat == "Bull Call Spread":
-            st.sidebar.subheader("Bull Call Settings")
-            config = BullCallSpreadConfig(
-                min_daily_volume=1000000, min_open_interest=500, 
-                max_iv_rank=st.sidebar.number_input("Max IV Rank", 0, 100, 50),
-                target_dte_min=45, target_dte_max=90, long_call_delta=0.55, short_call_delta=0.30,
-                delta_tolerance=0.05, max_debit_to_width_ratio=0.50, min_profit_to_risk_ratio=1.0
-            )
-        else:
-            st.sidebar.subheader("Straddle Settings")
-            config = LongStraddleConfig(
-                min_daily_volume=1000000, min_open_interest=500, 
-                max_iv_rank=st.sidebar.number_input("Max IV Rank", 0, 100, 40),
-                target_dte_min=14, target_dte_max=60, delta_tolerance=0.10, max_cost_pct=0.10
-            )
+        is_high_vol = "Yes" in vol_expect
+        
+        st.info(f"""
+        **Strategy Logic:**
+        - **Strikes:** Targets -33%, -8%, +8%, +33% relative to Spot Price.
+        - **Structure:** Adapts leg direction (Buy/Sell) based on {sentiment} sentiment and {'High' if is_high_vol else 'Low'} Volatility expectation.
+        """)
 
-        # Inputs
-        c1, c2, c3, c4 = st.columns(4)
-        ticker = c1.text_input("Ticker", "TSLA").upper()
-        price = c2.number_input("Price", value=250.0)
-        iv_rank = c3.number_input("IV Rank", value=65.0)
-        earnings = c4.number_input("Days to Earnings", value=60)
-
-        if st.button("Run Algo Simulation"):
-            # Mock Data Generation
-            stock_data = StockData(ticker, price, 50000000, iv_rank, earnings)
-            expiry = 35 if algo_strat == "Iron Condor" else 60
-            chain = generate_mock_chain(ticker, price, expiry, iv_rank > 50)
-            
-            # Init & Run
-            if algo_strat == "Iron Condor": engine = IronCondorStrategy(config)
-            elif algo_strat == "Bull Call Spread": engine = BullCallSpreadStrategy(config)
-            else: engine = LongStraddleStrategy(config)
-
-            c_log, c_res = st.columns([1,1])
-            with c_log:
-                st.write("**Logic Check:**")
-                passed = engine.check_filters(stock_data)
-                legs = engine.find_strikes(stock_data, chain) if passed else None
-                res = engine.validate_trade(legs) if legs else None
-                for l in engine.logs:
-                    if "FAIL" in l or "ABORT" in l: st.error(l)
-                    else: st.success(l)
-            
-            with c_res:
-                st.write("**Outcome:**")
-                if res:
-                    st.balloons()
-                    st.success(f"APPROVED: {res['type']}")
-                    st.code(res['strikes'])
-                    st.json(res)
-                elif not passed: st.warning("Failed Universe Filters")
-                elif not legs: st.warning("Failed Geometry/Strikes")
-                else: st.warning("Failed Safety Constraints")
+        if st.button("Generate Strategy"):
+            with st.spinner(f"Fetching Real-Time Chain for {ticker}..."):
+                res, error = analyze_custom_strategy(ticker, sentiment, is_high_vol)
+                
+                if error:
+                    st.error(f"Analysis Failed: {error}")
+                else:
+                    st.success(f"Strategy Generated for {ticker} (Expiry: {res['expiry']})")
+                    st.metric("Current Price", f"${res['current_price']:.2f}")
+                    
+                    # Display Legs
+                    st.subheader("1. Trade Structure")
+                    legs_df = pd.DataFrame(res['legs'])
+                    st.dataframe(legs_df.style.format({"Price": "${:.2f}", "Strike": "${:.2f}"}), use_container_width=True)
+                    
+                    # Display Financials
+                    st.subheader("2. Risk Profile")
+                    col1, col2, col3 = st.columns(3)
+                    
+                    net = res['net_premium']
+                    lbl = "Net Credit" if net > 0 else "Net Debit"
+                    col1.metric(lbl, f"${abs(net):.2f}")
+                    
+                    col2.metric("Max Potential Profit", f"${res['max_upside']:.2f}")
+                    col3.metric("Max Potential Loss", f"${res['max_loss']:.2f}")
+                    
+                    # P&L Explanation
+                    st.caption(f"Note: Max Profit/Loss are theoretical estimates at expiration based on the 4 legs. 'Net Credit' means you receive money upfront; 'Net Debit' means you pay upfront.")
 
 if __name__ == "__main__":
     main()
