@@ -203,7 +203,6 @@ def calculate_strategy_metrics(legs, current_price):
         net_premium += impact
 
     # Simulation for Max Upside/Loss
-    # Range: 50% to 150% of current price to catch wings
     sim_prices = sorted([l['row']['strike'] for l in legs] + [current_price])
     min_p = current_price * 0.5
     max_p = current_price * 1.5
@@ -258,39 +257,50 @@ def analyze_custom_strategy(ticker, sentiment, volatility_high, optimize=False):
 
         # --- BASE STRATEGY CONSTRUCTION ---
         targets = {
-            "pf": current_price * 0.85, # Put Far
-            "pn": current_price * 0.92, # Put Near
-            "cn": current_price * 1.08, # Call Near
-            "cf": current_price * 1.15  # Call Far
+            "pf": current_price * 0.85, # Put Far (15% cheaper)
+            "pn": current_price * 0.92, # Put Near (8% cheaper)
+            "cn": current_price * 1.08, # Call Near (8% expensive)
+            "cf": current_price * 1.15  # Call Far (15% expensive)
         }
         
         # Helper to build legs from specific rows
         def build_legs(pf_row, pn_row, cn_row, cf_row):
             l = []
-            if sentiment == "Bullish":
-                if not volatility_high: # Credit Spread Bias
+            
+            # --- STRUCTURE DEFINITION ---
+            # Volatility LOW (<10% move): Spread structures
+            # Volatility HIGH (>10% move): Diagonal/Long structures
+            
+            if not volatility_high:
+                # Low Volatility (Credit/Debit Bias)
+                if sentiment == "Bullish":
+                    # Buy P(-15%), Sell P(-8%), Buy C(+8%), Sell C(+15%) -> Net Bullish Condor
                     l = [
                         {"type": "Put", "action": "Buy", "row": pf_row, "desc": "Far Put (Long)"},
                         {"type": "Put", "action": "Sell", "row": pn_row, "desc": "Near Put (Short)"},
                         {"type": "Call", "action": "Buy", "row": cn_row, "desc": "Near Call (Long)"},
                         {"type": "Call", "action": "Sell", "row": cf_row, "desc": "Far Call (Short)"},
                     ]
-                else: # Debit Spread Bias (Explosive)
+                else: # Bearish
+                    # Sell P(-15%), Buy P(-8%), Sell C(+8%), Buy C(+15%) -> Net Bearish Condor
                     l = [
                         {"type": "Put", "action": "Sell", "row": pf_row, "desc": "Far Put (Short)"},
                         {"type": "Put", "action": "Buy", "row": pn_row, "desc": "Near Put (Long)"},
                         {"type": "Call", "action": "Sell", "row": cn_row, "desc": "Near Call (Short)"},
                         {"type": "Call", "action": "Buy", "row": cf_row, "desc": "Far Call (Long)"},
                     ]
-            else: # Bearish
-                if not volatility_high:
+            else: 
+                # High Volatility (Inverted/Explosive Structure)
+                if sentiment == "Bullish":
+                    # Inverted of Bullish/Low Vol: Sell P(-15%), Buy P(-8%), Sell C(+8%), Buy C(+15%)
                     l = [
                         {"type": "Put", "action": "Sell", "row": pf_row, "desc": "Far Put (Short)"},
                         {"type": "Put", "action": "Buy", "row": pn_row, "desc": "Near Put (Long)"},
                         {"type": "Call", "action": "Sell", "row": cn_row, "desc": "Near Call (Short)"},
                         {"type": "Call", "action": "Buy", "row": cf_row, "desc": "Far Call (Long)"},
                     ]
-                else:
+                else: # Bearish
+                    # Inverted of Bearish/Low Vol: Buy P(-15%), Sell P(-8%), Buy C(+8%), Sell C(+15%)
                     l = [
                         {"type": "Put", "action": "Buy", "row": pf_row, "desc": "Far Put (Long)"},
                         {"type": "Put", "action": "Sell", "row": pn_row, "desc": "Near Put (Short)"},
@@ -306,46 +316,53 @@ def analyze_custom_strategy(ticker, sentiment, volatility_high, optimize=False):
         cf_base = find_closest_strike(calls, targets["cf"])
         
         if any(x is None for x in [pf_base, pn_base, cn_base, cf_base]):
-            return None, "Could not find base strikes."
+            return None, "Could not find base strikes at required depth."
 
         base_legs = build_legs(pf_base, pn_base, cn_base, cf_base)
         base_metrics = calculate_strategy_metrics(base_legs, current_price)
         
         result_payload = {
+            "ticker": ticker,
             "current_price": current_price,
             "expiry": target_date,
             "base": {
                 "metrics": base_metrics,
                 "legs": base_legs
-            }
+            },
+            "optimized": None # Initialize optimized slot
         }
 
         # --- OPTIMIZATION LOOP (THE SWEET SPOT SCANNER) ---
         if optimize:
             # We will scan neighbors of the base strikes to find MaxProfit > MaxLoss
-            # Get indices in the dataframe
-            def get_idx(df, strike): return df.index[df['strike'] == strike].tolist()[0]
             
+            # Helper to safely get index
+            def get_idx(df, strike): 
+                indices = df.index[df['strike'] == strike].tolist()
+                return indices[0] if indices else -1
+
             pf_idx = get_idx(puts, pf_base['strike'])
             pn_idx = get_idx(puts, pn_base['strike'])
             cn_idx = get_idx(calls, cn_base['strike'])
             cf_idx = get_idx(calls, cf_base['strike'])
             
+            if any(i == -1 for i in [pf_idx, pn_idx, cn_idx, cf_idx]):
+                 # If base indices weren't found precisely (shouldn't happen if base was successful)
+                 return result_payload, None 
+
             best_ratio = -1.0
             best_config = None
             
             # Scan range: +/- 2 strikes around the targets
-            # We want to vary wings mostly to optimize R/R
-            range_scan = range(-1, 2) 
+            range_scan = range(-2, 3) 
             
-            # Limit iterations for performance
-            iterations = 0
+            # Limit iterations for safety
             
             for i1 in range_scan: # Put Far Offset
                 for i2 in range_scan: # Put Near Offset
                     for i3 in range_scan: # Call Near Offset
                         for i4 in range_scan: # Call Far Offset
-                            iterations += 1
+                            
                             # Safety bounds
                             if not (0 <= pf_idx+i1 < len(puts)): continue
                             if not (0 <= pn_idx+i2 < len(puts)): continue
@@ -366,10 +383,9 @@ def analyze_custom_strategy(ticker, sentiment, volatility_high, optimize=False):
                             cand_metrics = calculate_strategy_metrics(cand_legs, current_price)
                             
                             # Metric: Profit / Loss Ratio
-                            # Avoid div by zero
                             max_loss_abs = abs(cand_metrics['max_loss'])
                             if max_loss_abs < 0.01: 
-                                ratio = 0 # Invalid
+                                ratio = 0
                             else:
                                 ratio = cand_metrics['max_upside'] / max_loss_abs
                                 
@@ -391,6 +407,40 @@ def analyze_custom_strategy(ticker, sentiment, volatility_high, optimize=False):
 # ==========================================
 # PART 3: MAIN APP INTERFACE
 # ==========================================
+
+def display_strategy_details(data, label, current_price, initial_sentiment, initial_vol):
+    """Generates the detailed expander content for a single strategy result."""
+    
+    st.markdown(f"**{label}**")
+    m = data['metrics']
+    
+    # Financials
+    col1, col2, col3, col4 = st.columns(4)
+    net = m['net_premium']
+    lbl = "Net Credit" if net > 0 else "Net Debit"
+    col1.metric("Spot Price", f"${current_price:.2f}")
+    col2.metric(lbl, f"${abs(net):.2f}")
+    col3.metric("Max Profit", f"${m['max_upside']:.2f}")
+    col4.metric("Max Loss", f"${abs(m['max_loss']):.2f}")
+    
+    # Reward/Risk Ratio
+    ratio = m['max_upside'] / abs(m['max_loss']) if abs(m['max_loss']) > 0 else 0
+    st.markdown(f"**Reward/Risk Ratio:** `{ratio:.2f}`")
+    
+    if ratio > 1.0:
+        st.success(f"🌟 Sweet Spot: Max Profit > Max Loss!")
+    elif net > 0 and ratio > 0.3:
+        st.info("High probability, low Risk/Reward (Typical Credit Strategy).")
+    
+    # Legs Table
+    legs_simple = []
+    for l in data['legs']:
+        legs_simple.append({
+            "Action": l['action'], "Type": l['type'], 
+            "Strike": l['row']['strike'], "Price": get_price(l['row'], 'ask' if l['action']=="Buy" else 'bid')
+        })
+    st.dataframe(pd.DataFrame(legs_simple).style.format({"Price": "${:.2f}", "Strike": "${:.2f}"}), use_container_width=True)
+
 
 def main():
     st.title("🛡️ Options Strategy Master")
@@ -459,76 +509,101 @@ def main():
     # ==========================================
     else:
         st.subheader("🤖 Custom 4-Leg Strategy Generator")
-        st.caption("Constructs a 4-leg structure based on Sentiment & Expected Move using **Real-Time Data**.")
+        st.caption("Constructs an optimized 4-leg structure based on your market view.")
         
         # 1. Inputs
-        c1, c2, c3 = st.columns(3)
-        ticker = c1.text_input("Stock Ticker", "TSLA").upper()
-        sentiment = c2.selectbox("Your Sentiment", ["Bullish", "Bearish"])
-        vol_expect = c3.selectbox("Expect >10% Move?", ["No (Range Bound / <10%)", "Yes (Breakout / >10%)"])
+        c1, c2 = st.columns(2)
+        default_tickers = "TSLA, AAPL, AMD"
+        ticker_input = c1.text_input("Stock Tickers (comma-separated)", default_tickers).upper()
+        sentiment = c1.selectbox("Your Sentiment (Applied to All)", ["Bullish", "Bearish"])
+        vol_expect = c2.selectbox("Expect >10% Move?", ["No (Range Bound / <10%)", "Yes (Breakout / >10%)"])
         
         is_high_vol = "Yes" in vol_expect
         
         st.info(f"""
-        **Strategy Logic:**
-        1. **Base:** Targets -15%, -8%, +8%, +15% relative to Spot Price.
-        2. **Optimized:** Scans neighboring strikes to find the 'Sweet Spot' (Max Gain > Max Loss).
+        **Optimization Goal:** Find the highest Reward/Risk ratio for the defined structure and sentiment.
+        - **Target Strikes:** -15%, -8%, +8%, +15% from spot price.
         """)
 
-        if st.button("Generate & Optimize Strategy"):
-            with st.spinner(f"Fetching Real-Time Chain & Optimizing for {ticker}..."):
-                res, error = analyze_custom_strategy(ticker, sentiment, is_high_vol, optimize=True)
-                
-                if error:
-                    st.error(f"Analysis Failed: {error}")
-                else:
-                    st.success(f"Strategy Generated for {ticker} (Expiry: {res['expiry']})")
-                    st.metric("Current Price", f"${res['current_price']:.2f}")
-                    
-                    # --- DISPLAY LOGIC ---
-                    
-                    def display_strategy(data, label):
-                        st.markdown(f"### {label}")
-                        # Financials
-                        m = data['metrics']
-                        col1, col2, col3, col4 = st.columns(4)
-                        net = m['net_premium']
-                        lbl = "Net Credit" if net > 0 else "Net Debit"
-                        col1.metric(lbl, f"${abs(net):.2f}")
-                        col2.metric("Max Profit", f"${m['max_upside']:.2f}")
-                        col3.metric("Max Loss", f"${abs(m['max_loss']):.2f}")
-                        
-                        ratio = m['max_upside'] / abs(m['max_loss']) if abs(m['max_loss']) > 0 else 0
-                        col4.metric("Reward/Risk", f"{ratio:.2f}")
-                        
-                        if ratio > 1.0:
-                            st.success(f"🌟 SWEET SPOT FOUND! Profit > Loss (Ratio {ratio:.2f})")
-                        
-                        # Legs Table
-                        legs_simple = []
-                        for l in data['legs']:
-                            legs_simple.append({
-                                "Action": l['action'], "Type": l['type'], 
-                                "Strike": l['row']['strike'], "Price": get_price(l['row'], 'ask' if l['action']=="Buy" else 'bid')
-                            })
-                        st.dataframe(pd.DataFrame(legs_simple).style.format({"Price": "${:.2f}", "Strike": "${:.2f}"}), use_container_width=True)
+        if st.button("Generate & Optimize Strategies"):
+            if not ticker_input:
+                st.error("Please enter at least one ticker.")
+                return
 
-                    # 1. Base Strategy
-                    with st.expander("📌 Base Strategy (Fixed 15%/8% Targets)", expanded=True):
-                        display_strategy(res['base'], "Base Results")
+            tickers = [t.strip().upper() for t in ticker_input.split(',') if t.strip()]
+            all_results = {}
+            all_summaries = []
+            errors = []
+
+            progress_bar = st.progress(0)
+            
+            with st.spinner(f"Fetching data and optimizing across {len(tickers)} tickers..."):
+                for i, ticker in enumerate(tickers):
+                    res, error = analyze_custom_strategy(ticker, sentiment, is_high_vol, optimize=True)
                     
-                    # 2. Optimized Strategy
-                    opt = res.get('optimized')
-                    if opt:
-                        # Check if it's different/better
+                    if error:
+                        errors.append(f"{ticker}: {error}")
+                    else:
+                        all_results[ticker] = res
+                        
+                        # Use the OPTIMIZED metrics for the summary table
+                        metrics = res['optimized']['metrics']
+                        ratio = res['optimized']['ratio']
+                        
+                        summary_data = {
+                            "Stock": ticker,
+                            "Spot Price": f"${res['current_price']:.2f}",
+                            "Net Premium": f"${metrics['net_premium']:.2f}",
+                            "Max Profit": f"${metrics['max_upside']:.2f}",
+                            "Max Loss": f"${abs(metrics['max_loss']):.2f}",
+                            "Reward/Risk": f"{ratio:.2f}"
+                        }
+                        all_summaries.append(summary_data)
+                    
+                    progress_bar.progress((i + 1) / len(tickers))
+
+            # --- OUTPUT ---
+            st.divider()
+            
+            if all_summaries:
+                st.header("1. Strategy Summary (Optimized Results)")
+                summary_df = pd.DataFrame(all_summaries)
+                st.dataframe(summary_df, hide_index=True, use_container_width=True)
+
+                st.header("2. Detailed Trade Structure & P&L")
+                
+                for ticker, res in all_results.items():
+                    with st.expander(f"✨ {ticker} Optimized Strategy (R/R {res['optimized']['ratio']:.2f})", expanded=False):
+                        
+                        # Check if optimized is significantly better than base
                         base_ratio = res['base']['metrics']['max_upside'] / abs(res['base']['metrics']['max_loss'])
-                        if opt['ratio'] > base_ratio:
-                             st.divider()
-                             st.markdown("👇 **Recommendation: Better Ratio Found**")
-                             with st.expander(f"🚀 Optimized 'Sweet Spot' Strategy (Ratio {opt['ratio']:.2f})", expanded=True):
-                                display_strategy(opt, "Optimized Results")
-                        else:
-                            st.info("The Base strategy is already optimal within the search range.")
+                        opt_ratio = res['optimized']['ratio']
+
+                        if opt_ratio > base_ratio:
+                            st.info(f"Optimization improved R/R from {base_ratio:.2f} to {opt_ratio:.2f}.")
+
+                        display_strategy_details(
+                            res['optimized'], 
+                            f"Recommended Optimized Strategy (R/R {opt_ratio:.2f})", 
+                            res['current_price'],
+                            sentiment,
+                            is_high_vol
+                        )
+                        
+                        # Show base for comparison
+                        with st.expander("Show Base Strategy (Fixed Targets)"):
+                            display_strategy_details(
+                                res['base'], 
+                                f"Base Strategy (R/R {base_ratio:.2f})", 
+                                res['current_price'],
+                                sentiment,
+                                is_high_vol
+                            )
+
+            if errors:
+                with st.expander("Errors / Skipped Tickers"):
+                    for err in errors:
+                        st.write(f"- {err}")
 
 if __name__ == "__main__":
     main()
