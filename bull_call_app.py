@@ -552,6 +552,7 @@ def main():
                         
                         summary_data = {
                             "Stock": ticker,
+                            "Expiry Date": res['expiry'], # <<< ADDED EXPIRY DATE HERE
                             "Spot Price": f"${res['current_price']:.2f}",
                             "Net Premium": f"${metrics['net_premium']:.2f}",
                             "Max Profit": f"${metrics['max_upside']:.2f}",
@@ -568,6 +569,9 @@ def main():
             if all_summaries:
                 st.header("1. Strategy Summary (Optimized Results)")
                 summary_df = pd.DataFrame(all_summaries)
+                # Reorder columns to put Expiry Date next to Stock
+                cols = ["Stock", "Expiry Date", "Spot Price", "Net Premium", "Max Profit", "Max Loss", "Reward/Risk"]
+                summary_df = summary_df[cols]
                 st.dataframe(summary_df, hide_index=True, use_container_width=True)
 
                 st.header("2. Detailed Trade Structure & P&L")
