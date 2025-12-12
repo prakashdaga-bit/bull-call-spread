@@ -230,9 +230,8 @@ def calculate_strategy_metrics(legs, current_price):
 @st.cache_data(ttl=300, show_spinner=False)
 def analyze_custom_strategy(ticker, sentiment, volatility_high, optimize=False):
     """
-    1. Fetches Chain.
-    2. Builds 'Base' Strategy (Fixed %).
-    3. If optimize=True, scans neighbors to find Max Profit > Max Loss (Sweet Spot).
+    Fetches Next 3 Monthly Expirations and runs logic for each.
+    Returns a list of result objects.
     """
     try:
         # 1. Fetch Data
@@ -244,162 +243,158 @@ def analyze_custom_strategy(ticker, sentiment, volatility_high, optimize=False):
             if hist.empty: return None, "No price data found."
             current_price = hist['Close'].iloc[-1]
             
-        dates = get_monthly_expirations(stock, limit=2)
+        dates = get_monthly_expirations(stock, limit=3)
         if not dates: return None, "No option chain found."
-        target_date = dates[0] 
         
-        chain = get_option_chain_with_retry(stock, target_date)
-        # We need tradeable options, but sorted by strike
-        calls = filter_tradeable_options(chain.calls).sort_values('strike').reset_index(drop=True)
-        puts = filter_tradeable_options(chain.puts).sort_values('strike').reset_index(drop=True)
-        
-        if calls.empty or puts.empty: return None, "Chain data incomplete."
+        results_list = []
+        errors = []
 
-        # --- BASE STRATEGY CONSTRUCTION ---
-        targets = {
-            "pf": current_price * 0.85, # Put Far (15% cheaper)
-            "pn": current_price * 0.92, # Put Near (8% cheaper)
-            "cn": current_price * 1.08, # Call Near (8% expensive)
-            "cf": current_price * 1.15  # Call Far (15% expensive)
-        }
-        
-        # Helper to build legs from specific rows
-        def build_legs(pf_row, pn_row, cn_row, cf_row):
-            l = []
-            
-            # --- STRUCTURE DEFINITION ---
-            # Volatility LOW (<10% move): Spread structures
-            # Volatility HIGH (>10% move): Diagonal/Long structures
-            
-            if not volatility_high:
-                # Low Volatility (Credit/Debit Bias)
-                if sentiment == "Bullish":
-                    # Buy P(-15%), Sell P(-8%), Buy C(+8%), Sell C(+15%) -> Net Bullish Condor
-                    l = [
-                        {"type": "Put", "action": "Buy", "row": pf_row, "desc": "Far Put (Long)"},
-                        {"type": "Put", "action": "Sell", "row": pn_row, "desc": "Near Put (Short)"},
-                        {"type": "Call", "action": "Buy", "row": cn_row, "desc": "Near Call (Long)"},
-                        {"type": "Call", "action": "Sell", "row": cf_row, "desc": "Far Call (Short)"},
-                    ]
-                else: # Bearish
-                    # Sell P(-15%), Buy P(-8%), Sell C(+8%), Buy C(+15%) -> Net Bearish Condor
-                    l = [
-                        {"type": "Put", "action": "Sell", "row": pf_row, "desc": "Far Put (Short)"},
-                        {"type": "Put", "action": "Buy", "row": pn_row, "desc": "Near Put (Long)"},
-                        {"type": "Call", "action": "Sell", "row": cn_row, "desc": "Near Call (Short)"},
-                        {"type": "Call", "action": "Buy", "row": cf_row, "desc": "Far Call (Long)"},
-                    ]
-            else: 
-                # High Volatility (Inverted/Explosive Structure)
-                if sentiment == "Bullish":
-                    # Inverted of Bullish/Low Vol: Sell P(-15%), Buy P(-8%), Sell C(+8%), Buy C(+15%)
-                    l = [
-                        {"type": "Put", "action": "Sell", "row": pf_row, "desc": "Far Put (Short)"},
-                        {"type": "Put", "action": "Buy", "row": pn_row, "desc": "Near Put (Long)"},
-                        {"type": "Call", "action": "Sell", "row": cn_row, "desc": "Near Call (Short)"},
-                        {"type": "Call", "action": "Buy", "row": cf_row, "desc": "Far Call (Long)"},
-                    ]
-                else: # Bearish
-                    # Inverted of Bearish/Low Vol: Buy P(-15%), Sell P(-8%), Buy C(+8%), Sell C(+15%)
-                    l = [
-                        {"type": "Put", "action": "Buy", "row": pf_row, "desc": "Far Put (Long)"},
-                        {"type": "Put", "action": "Sell", "row": pn_row, "desc": "Near Put (Short)"},
-                        {"type": "Call", "action": "Buy", "row": cn_row, "desc": "Near Call (Long)"},
-                        {"type": "Call", "action": "Sell", "row": cf_row, "desc": "Far Call (Short)"},
-                    ]
-            return l
+        # LOOP THROUGH EACH EXPIRATION
+        for target_date in dates:
+            try:
+                chain = get_option_chain_with_retry(stock, target_date)
+                # We need tradeable options, but sorted by strike
+                calls = filter_tradeable_options(chain.calls).sort_values('strike').reset_index(drop=True)
+                puts = filter_tradeable_options(chain.puts).sort_values('strike').reset_index(drop=True)
+                
+                if calls.empty or puts.empty: 
+                    continue # Skip this date if data missing
 
-        # Find Base Rows
-        pf_base = find_closest_strike(puts, targets["pf"])
-        pn_base = find_closest_strike(puts, targets["pn"])
-        cn_base = find_closest_strike(calls, targets["cn"])
-        cf_base = find_closest_strike(calls, targets["cf"])
-        
-        if any(x is None for x in [pf_base, pn_base, cn_base, cf_base]):
-            return None, "Could not find base strikes at required depth."
+                # --- BASE STRATEGY CONSTRUCTION ---
+                targets = {
+                    "pf": current_price * 0.85, # Put Far (15% cheaper)
+                    "pn": current_price * 0.92, # Put Near (8% cheaper)
+                    "cn": current_price * 1.08, # Call Near (8% expensive)
+                    "cf": current_price * 1.15  # Call Far (15% expensive)
+                }
+                
+                # Helper to build legs from specific rows
+                def build_legs(pf_row, pn_row, cn_row, cf_row):
+                    l = []
+                    if not volatility_high:
+                        # Low Volatility (Credit/Debit Bias)
+                        if sentiment == "Bullish":
+                            l = [
+                                {"type": "Put", "action": "Buy", "row": pf_row, "desc": "Far Put (Long)"},
+                                {"type": "Put", "action": "Sell", "row": pn_row, "desc": "Near Put (Short)"},
+                                {"type": "Call", "action": "Buy", "row": cn_row, "desc": "Near Call (Long)"},
+                                {"type": "Call", "action": "Sell", "row": cf_row, "desc": "Far Call (Short)"},
+                            ]
+                        else: # Bearish
+                            l = [
+                                {"type": "Put", "action": "Sell", "row": pf_row, "desc": "Far Put (Short)"},
+                                {"type": "Put", "action": "Buy", "row": pn_row, "desc": "Near Put (Long)"},
+                                {"type": "Call", "action": "Sell", "row": cn_row, "desc": "Near Call (Short)"},
+                                {"type": "Call", "action": "Buy", "row": cf_row, "desc": "Far Call (Long)"},
+                            ]
+                    else: 
+                        # High Volatility (Inverted/Explosive Structure)
+                        if sentiment == "Bullish":
+                            l = [
+                                {"type": "Put", "action": "Sell", "row": pf_row, "desc": "Far Put (Short)"},
+                                {"type": "Put", "action": "Buy", "row": pn_row, "desc": "Near Put (Long)"},
+                                {"type": "Call", "action": "Sell", "row": cn_row, "desc": "Near Call (Short)"},
+                                {"type": "Call", "action": "Buy", "row": cf_row, "desc": "Far Call (Long)"},
+                            ]
+                        else: # Bearish
+                            l = [
+                                {"type": "Put", "action": "Buy", "row": pf_row, "desc": "Far Put (Long)"},
+                                {"type": "Put", "action": "Sell", "row": pn_row, "desc": "Near Put (Short)"},
+                                {"type": "Call", "action": "Buy", "row": cn_row, "desc": "Near Call (Long)"},
+                                {"type": "Call", "action": "Sell", "row": cf_row, "desc": "Far Call (Short)"},
+                            ]
+                    return l
 
-        base_legs = build_legs(pf_base, pn_base, cn_base, cf_base)
-        base_metrics = calculate_strategy_metrics(base_legs, current_price)
-        
-        result_payload = {
-            "ticker": ticker,
-            "current_price": current_price,
-            "expiry": target_date,
-            "base": {
-                "metrics": base_metrics,
-                "legs": base_legs
-            },
-            "optimized": None # Initialize optimized slot
-        }
+                # Find Base Rows
+                pf_base = find_closest_strike(puts, targets["pf"])
+                pn_base = find_closest_strike(puts, targets["pn"])
+                cn_base = find_closest_strike(calls, targets["cn"])
+                cf_base = find_closest_strike(calls, targets["cf"])
+                
+                if any(x is None for x in [pf_base, pn_base, cn_base, cf_base]):
+                    # Skip if strikes not found
+                    continue 
 
-        # --- OPTIMIZATION LOOP (THE SWEET SPOT SCANNER) ---
-        if optimize:
-            # We will scan neighbors of the base strikes to find MaxProfit > MaxLoss
-            
-            # Helper to safely get index
-            def get_idx(df, strike): 
-                indices = df.index[df['strike'] == strike].tolist()
-                return indices[0] if indices else -1
+                base_legs = build_legs(pf_base, pn_base, cn_base, cf_base)
+                base_metrics = calculate_strategy_metrics(base_legs, current_price)
+                
+                payload = {
+                    "ticker": ticker,
+                    "current_price": current_price,
+                    "expiry": target_date,
+                    "base": {
+                        "metrics": base_metrics,
+                        "legs": base_legs
+                    },
+                    "optimized": None 
+                }
 
-            pf_idx = get_idx(puts, pf_base['strike'])
-            pn_idx = get_idx(puts, pn_base['strike'])
-            cn_idx = get_idx(calls, cn_base['strike'])
-            cf_idx = get_idx(calls, cf_base['strike'])
-            
-            if any(i == -1 for i in [pf_idx, pn_idx, cn_idx, cf_idx]):
-                 # If base indices weren't found precisely (shouldn't happen if base was successful)
-                 return result_payload, None 
+                # --- OPTIMIZATION LOOP ---
+                if optimize:
+                    def get_idx(df, strike): 
+                        indices = df.index[df['strike'] == strike].tolist()
+                        return indices[0] if indices else -1
 
-            best_ratio = -1.0
-            best_config = None
-            
-            # Scan range: +/- 2 strikes around the targets
-            range_scan = range(-2, 3) 
-            
-            # Limit iterations for safety
-            
-            for i1 in range_scan: # Put Far Offset
-                for i2 in range_scan: # Put Near Offset
-                    for i3 in range_scan: # Call Near Offset
-                        for i4 in range_scan: # Call Far Offset
-                            
-                            # Safety bounds
-                            if not (0 <= pf_idx+i1 < len(puts)): continue
-                            if not (0 <= pn_idx+i2 < len(puts)): continue
-                            if not (0 <= cn_idx+i3 < len(calls)): continue
-                            if not (0 <= cf_idx+i4 < len(calls)): continue
-                            
-                            # Construct candidate rows
-                            pf_cand = puts.iloc[pf_idx+i1]
-                            pn_cand = puts.iloc[pn_idx+i2]
-                            cn_cand = calls.iloc[cn_idx+i3]
-                            cf_cand = calls.iloc[cf_idx+i4]
-                            
-                            # Logical Check: Strikes must maintain order
-                            if pf_cand['strike'] >= pn_cand['strike']: continue
-                            if cn_cand['strike'] >= cf_cand['strike']: continue
-                            
-                            cand_legs = build_legs(pf_cand, pn_cand, cn_cand, cf_cand)
-                            cand_metrics = calculate_strategy_metrics(cand_legs, current_price)
-                            
-                            # Metric: Profit / Loss Ratio
-                            max_loss_abs = abs(cand_metrics['max_loss'])
-                            if max_loss_abs < 0.01: 
-                                ratio = 0
-                            else:
-                                ratio = cand_metrics['max_upside'] / max_loss_abs
-                                
-                            if ratio > best_ratio:
-                                best_ratio = ratio
-                                best_config = {
-                                    "metrics": cand_metrics,
-                                    "legs": cand_legs,
-                                    "ratio": ratio
-                                }
-            
-            result_payload["optimized"] = best_config
+                    pf_idx = get_idx(puts, pf_base['strike'])
+                    pn_idx = get_idx(puts, pn_base['strike'])
+                    cn_idx = get_idx(calls, cn_base['strike'])
+                    cf_idx = get_idx(calls, cf_base['strike'])
+                    
+                    if not any(i == -1 for i in [pf_idx, pn_idx, cn_idx, cf_idx]):
+                        best_ratio = -1.0
+                        best_config = None
+                        
+                        # Scan range: +/- 2 strikes around the targets
+                        range_scan = range(-2, 3) 
+                        
+                        for i1 in range_scan: # Put Far
+                            for i2 in range_scan: # Put Near
+                                for i3 in range_scan: # Call Near
+                                    for i4 in range_scan: # Call Far
+                                        # Safety bounds
+                                        if not (0 <= pf_idx+i1 < len(puts)): continue
+                                        if not (0 <= pn_idx+i2 < len(puts)): continue
+                                        if not (0 <= cn_idx+i3 < len(calls)): continue
+                                        if not (0 <= cf_idx+i4 < len(calls)): continue
+                                        
+                                        # Construct candidate rows
+                                        pf_cand = puts.iloc[pf_idx+i1]
+                                        pn_cand = puts.iloc[pn_idx+i2]
+                                        cn_cand = calls.iloc[cn_idx+i3]
+                                        cf_cand = calls.iloc[cf_idx+i4]
+                                        
+                                        # Logical Check
+                                        if pf_cand['strike'] >= pn_cand['strike']: continue
+                                        if cn_cand['strike'] >= cf_cand['strike']: continue
+                                        
+                                        cand_legs = build_legs(pf_cand, pn_cand, cn_cand, cf_cand)
+                                        cand_metrics = calculate_strategy_metrics(cand_legs, current_price)
+                                        
+                                        max_loss_abs = abs(cand_metrics['max_loss'])
+                                        ratio = 0 if max_loss_abs < 0.01 else cand_metrics['max_upside'] / max_loss_abs
+                                            
+                                        if ratio > best_ratio:
+                                            best_ratio = ratio
+                                            best_config = {
+                                                "metrics": cand_metrics,
+                                                "legs": cand_legs,
+                                                "ratio": ratio
+                                            }
+                        
+                        payload["optimized"] = best_config
+                
+                # Add successful payload to list
+                results_list.append(payload)
 
-        return result_payload, None
+            except Exception as e:
+                # Log error for this specific date but continue
+                errors.append(f"Date {target_date}: {str(e)}")
+                continue
+
+        if not results_list:
+             return None, "Could not build strategies for any of the next 3 expirations."
+
+        return results_list, None
 
     except Exception as e:
         return None, str(e)
@@ -523,6 +518,7 @@ def main():
         st.info(f"""
         **Optimization Goal:** Find the highest Reward/Risk ratio for the defined structure and sentiment.
         - **Target Strikes:** -15%, -8%, +8%, +15% from spot price.
+        - **Scanning:** Next 3 Monthly Expirations.
         """)
 
         if st.button("Generate & Optimize Strategies"):
@@ -531,7 +527,7 @@ def main():
                 return
 
             tickers = [t.strip().upper() for t in ticker_input.split(',') if t.strip()]
-            all_results = {}
+            all_results = {} # Store Key: Ticker, Value: List of Results
             all_summaries = []
             errors = []
 
@@ -539,27 +535,28 @@ def main():
             
             with st.spinner(f"Fetching data and optimizing across {len(tickers)} tickers..."):
                 for i, ticker in enumerate(tickers):
-                    res, error = analyze_custom_strategy(ticker, sentiment, is_high_vol, optimize=True)
+                    results_list, error = analyze_custom_strategy(ticker, sentiment, is_high_vol, optimize=True)
                     
                     if error:
                         errors.append(f"{ticker}: {error}")
                     else:
-                        all_results[ticker] = res
+                        all_results[ticker] = results_list
                         
-                        # Use the OPTIMIZED metrics for the summary table
-                        metrics = res['optimized']['metrics']
-                        ratio = res['optimized']['ratio']
-                        
-                        summary_data = {
-                            "Stock": ticker,
-                            "Expiry Date": res['expiry'], # <<< ADDED EXPIRY DATE HERE
-                            "Spot Price": f"${res['current_price']:.2f}",
-                            "Net Premium": f"${metrics['net_premium']:.2f}",
-                            "Max Profit": f"${metrics['max_upside']:.2f}",
-                            "Max Loss": f"${abs(metrics['max_loss']):.2f}",
-                            "Reward/Risk": f"{ratio:.2f}"
-                        }
-                        all_summaries.append(summary_data)
+                        # Add ALL expiries to summary
+                        for res in results_list:
+                            metrics = res['optimized']['metrics']
+                            ratio = res['optimized']['ratio']
+                            
+                            summary_data = {
+                                "Stock": ticker,
+                                "Expiry Date": res['expiry'],
+                                "Spot Price": f"${res['current_price']:.2f}",
+                                "Net Premium": f"${metrics['net_premium']:.2f}",
+                                "Max Profit": f"${metrics['max_upside']:.2f}",
+                                "Max Loss": f"${abs(metrics['max_loss']):.2f}",
+                                "Reward/Risk": f"{ratio:.2f}"
+                            }
+                            all_summaries.append(summary_data)
                     
                     progress_bar.progress((i + 1) / len(tickers))
 
@@ -569,40 +566,39 @@ def main():
             if all_summaries:
                 st.header("1. Strategy Summary (Optimized Results)")
                 summary_df = pd.DataFrame(all_summaries)
-                # Reorder columns to put Expiry Date next to Stock
                 cols = ["Stock", "Expiry Date", "Spot Price", "Net Premium", "Max Profit", "Max Loss", "Reward/Risk"]
                 summary_df = summary_df[cols]
                 st.dataframe(summary_df, hide_index=True, use_container_width=True)
 
                 st.header("2. Detailed Trade Structure & P&L")
                 
-                for ticker, res in all_results.items():
-                    with st.expander(f"✨ {ticker} Optimized Strategy (R/R {res['optimized']['ratio']:.2f})", expanded=False):
-                        
-                        # Check if optimized is significantly better than base
-                        base_ratio = res['base']['metrics']['max_upside'] / abs(res['base']['metrics']['max_loss'])
-                        opt_ratio = res['optimized']['ratio']
+                for ticker, results_list in all_results.items():
+                    st.markdown(f"### {ticker}")
+                    for res in results_list:
+                        with st.expander(f"📅 {res['expiry']} | Optimized R/R {res['optimized']['ratio']:.2f}", expanded=False):
+                            
+                            base_ratio = res['base']['metrics']['max_upside'] / abs(res['base']['metrics']['max_loss'])
+                            opt_ratio = res['optimized']['ratio']
 
-                        if opt_ratio > base_ratio:
-                            st.info(f"Optimization improved R/R from {base_ratio:.2f} to {opt_ratio:.2f}.")
+                            if opt_ratio > base_ratio:
+                                st.info(f"Optimization improved R/R from {base_ratio:.2f} to {opt_ratio:.2f}.")
 
-                        display_strategy_details(
-                            res['optimized'], 
-                            f"Recommended Optimized Strategy (R/R {opt_ratio:.2f})", 
-                            res['current_price'],
-                            sentiment,
-                            is_high_vol
-                        )
-                        
-                        # Show base for comparison
-                        with st.expander("Show Base Strategy (Fixed Targets)"):
                             display_strategy_details(
-                                res['base'], 
-                                f"Base Strategy (R/R {base_ratio:.2f})", 
+                                res['optimized'], 
+                                f"Recommended Optimized Strategy", 
                                 res['current_price'],
                                 sentiment,
                                 is_high_vol
                             )
+                            
+                            with st.expander("Show Base Strategy (Fixed Targets)"):
+                                display_strategy_details(
+                                    res['base'], 
+                                    f"Base Strategy", 
+                                    res['current_price'],
+                                    sentiment,
+                                    is_high_vol
+                                )
 
             if errors:
                 with st.expander("Errors / Skipped Tickers"):
