@@ -17,8 +17,8 @@ st.set_page_config(page_title="Options Strategy Master", page_icon="📈", layou
 # SHARED HELPER FUNCTIONS (Real Data)
 # ==========================================
 
-def get_monthly_expirations(ticker_obj, limit=3):
-    """Filters the list of expiration dates to find the next 'limit' distinct months."""
+def get_expirations_within_days(ticker_obj, days_limit=30):
+    """Returns all expiration dates within the next X days."""
     try:
         expirations = ticker_obj.options
     except:
@@ -26,17 +26,20 @@ def get_monthly_expirations(ticker_obj, limit=3):
         
     if not expirations:
         return []
-    dates = [datetime.datetime.strptime(date, '%Y-%m-%d') for date in expirations]
-    unique_months = []
-    seen_months = set()
-    for date in dates:
-        month_key = (date.year, date.month)
-        if month_key not in seen_months:
-            unique_months.append(date.strftime('%Y-%m-%d'))
-            seen_months.add(month_key)
-        if len(unique_months) >= limit:
-            break
-    return unique_months
+        
+    valid_dates = []
+    today = datetime.date.today()
+    limit_date = today + datetime.timedelta(days=days_limit)
+    
+    for date_str in expirations:
+        try:
+            exp_date = datetime.datetime.strptime(date_str, '%Y-%m-%d').date()
+            if today <= exp_date <= limit_date:
+                valid_dates.append(date_str)
+        except:
+            continue
+            
+    return valid_dates
 
 def filter_tradeable_options(chain):
     """Filters the option chain to keep only rows where Ask > 0 or LastPrice > 0."""
@@ -100,7 +103,8 @@ def fetch_and_analyze_ticker(ticker_symbol, strategy_type):
             if hist.empty: return None, None, f"No price data found for {ticker_symbol}."
             cmp = hist['Close'].iloc[-1]
 
-        target_dates = get_monthly_expirations(stock, limit=3)
+        # Use updated helper to get next few months roughly
+        target_dates = get_expirations_within_days(stock, days_limit=90)[:3] 
         if not target_dates: return None, None, f"No options data found for {ticker_symbol}."
 
         analysis_rows = []
@@ -203,9 +207,16 @@ def calculate_strategy_metrics(legs, current_price):
         net_premium += impact
 
     # Simulation for Max Upside/Loss
-    sim_prices = sorted([l['row']['strike'] for l in legs] + [current_price])
-    min_p = current_price * 0.5
-    max_p = current_price * 1.5
+    # Expand sim range to cover wings
+    strikes = [l['row']['strike'] for l in legs]
+    sim_prices = sorted(strikes + [current_price])
+    
+    # Dynamic range based on strikes
+    min_s, max_s = min(strikes), max(strikes)
+    range_width = max_s - min_s
+    min_p = min_s - (range_width * 0.5)
+    max_p = max_s + (range_width * 0.5)
+    
     sim_range = [min_p] + sim_prices + [max_p]
     
     profits = []
@@ -228,10 +239,10 @@ def calculate_strategy_metrics(legs, current_price):
     }
 
 @st.cache_data(ttl=300, show_spinner=False)
-def analyze_custom_strategy(ticker, sentiment, volatility_high, optimize=False):
+def analyze_custom_strategy(ticker, sentiment, slab1_pct, slab2_pct, days_window, optimize=False):
     """
-    Fetches Next 3 Monthly Expirations and runs logic for each.
-    Returns a list of result objects.
+    Fetches expirations within 'days_window'.
+    Builds strategy based on Slab 1 (Near) and Slab 2 (Far).
     """
     try:
         # 1. Fetch Data
@@ -243,8 +254,9 @@ def analyze_custom_strategy(ticker, sentiment, volatility_high, optimize=False):
             if hist.empty: return None, "No price data found."
             current_price = hist['Close'].iloc[-1]
             
-        dates = get_monthly_expirations(stock, limit=3)
-        if not dates: return None, "No option chain found."
+        # Get Expirations based on Window
+        dates = get_expirations_within_days(stock, days_limit=days_window)
+        if not dates: return None, f"No option chain found within {days_window} days."
         
         results_list = []
         errors = []
@@ -253,56 +265,44 @@ def analyze_custom_strategy(ticker, sentiment, volatility_high, optimize=False):
         for target_date in dates:
             try:
                 chain = get_option_chain_with_retry(stock, target_date)
-                # We need tradeable options, but sorted by strike
                 calls = filter_tradeable_options(chain.calls).sort_values('strike').reset_index(drop=True)
                 puts = filter_tradeable_options(chain.puts).sort_values('strike').reset_index(drop=True)
                 
-                if calls.empty or puts.empty: 
-                    continue # Skip this date if data missing
+                if calls.empty or puts.empty: continue
 
-                # --- BASE STRATEGY CONSTRUCTION ---
+                # --- TARGET CALCULATION BASED ON SLABS ---
+                # Slab 1 = Near (e.g., 6%), Slab 2 = Far (e.g., 10%)
+                s1 = slab1_pct / 100.0
+                s2 = slab2_pct / 100.0
+                
                 targets = {
-                    "pf": current_price * 0.85, # Put Far (15% cheaper)
-                    "pn": current_price * 0.92, # Put Near (8% cheaper)
-                    "cn": current_price * 1.08, # Call Near (8% expensive)
-                    "cf": current_price * 1.15  # Call Far (15% expensive)
+                    "pf": current_price * (1 - s2), # Put Far (Lower)
+                    "pn": current_price * (1 - s1), # Put Near (Higher)
+                    "cn": current_price * (1 + s1), # Call Near (Lower)
+                    "cf": current_price * (1 + s2)  # Call Far (Higher)
                 }
                 
-                # Helper to build legs from specific rows
+                # Helper to build legs
                 def build_legs(pf_row, pn_row, cn_row, cf_row):
                     l = []
-                    if not volatility_high:
-                        # Low Volatility (Credit/Debit Bias)
-                        if sentiment == "Bullish":
-                            l = [
-                                {"type": "Put", "action": "Buy", "row": pf_row, "desc": "Far Put (Long)"},
-                                {"type": "Put", "action": "Sell", "row": pn_row, "desc": "Near Put (Short)"},
-                                {"type": "Call", "action": "Buy", "row": cn_row, "desc": "Near Call (Long)"},
-                                {"type": "Call", "action": "Sell", "row": cf_row, "desc": "Far Call (Short)"},
-                            ]
-                        else: # Bearish
-                            l = [
-                                {"type": "Put", "action": "Sell", "row": pf_row, "desc": "Far Put (Short)"},
-                                {"type": "Put", "action": "Buy", "row": pn_row, "desc": "Near Put (Long)"},
-                                {"type": "Call", "action": "Sell", "row": cn_row, "desc": "Near Call (Short)"},
-                                {"type": "Call", "action": "Buy", "row": cf_row, "desc": "Far Call (Long)"},
-                            ]
-                    else: 
-                        # High Volatility (Inverted/Explosive Structure)
-                        if sentiment == "Bullish":
-                            l = [
-                                {"type": "Put", "action": "Sell", "row": pf_row, "desc": "Far Put (Short)"},
-                                {"type": "Put", "action": "Buy", "row": pn_row, "desc": "Near Put (Long)"},
-                                {"type": "Call", "action": "Sell", "row": cn_row, "desc": "Near Call (Short)"},
-                                {"type": "Call", "action": "Buy", "row": cf_row, "desc": "Far Call (Long)"},
-                            ]
-                        else: # Bearish
-                            l = [
-                                {"type": "Put", "action": "Buy", "row": pf_row, "desc": "Far Put (Long)"},
-                                {"type": "Put", "action": "Sell", "row": pn_row, "desc": "Near Put (Short)"},
-                                {"type": "Call", "action": "Buy", "row": cn_row, "desc": "Near Call (Long)"},
-                                {"type": "Call", "action": "Sell", "row": cf_row, "desc": "Far Call (Short)"},
-                            ]
+                    # Standard Directional Bias Logic (Low Vol assumption)
+                    if sentiment == "Bullish":
+                        # Bull Put Spread (Credit) + Bull Call Spread (Debit)
+                        # Buy Far Put, Sell Near Put, Buy Near Call, Sell Far Call
+                        l = [
+                            {"type": "Put", "action": "Buy", "row": pf_row, "desc": f"Put Long (-{slab2_pct}%)"},
+                            {"type": "Put", "action": "Sell", "row": pn_row, "desc": f"Put Short (-{slab1_pct}%)"},
+                            {"type": "Call", "action": "Buy", "row": cn_row, "desc": f"Call Long (+{slab1_pct}%)"},
+                            {"type": "Call", "action": "Sell", "row": cf_row, "desc": f"Call Short (+{slab2_pct}%)"},
+                        ]
+                    else: # Bearish
+                        # Bearish Logic: Inverted Bullish
+                        l = [
+                            {"type": "Put", "action": "Sell", "row": pf_row, "desc": f"Put Short (-{slab2_pct}%)"},
+                            {"type": "Put", "action": "Buy", "row": pn_row, "desc": f"Put Long (-{slab1_pct}%)"},
+                            {"type": "Call", "action": "Sell", "row": cn_row, "desc": f"Call Short (+{slab1_pct}%)"},
+                            {"type": "Call", "action": "Buy", "row": cf_row, "desc": f"Call Long (+{slab2_pct}%)"},
+                        ]
                     return l
 
                 # Find Base Rows
@@ -312,7 +312,6 @@ def analyze_custom_strategy(ticker, sentiment, volatility_high, optimize=False):
                 cf_base = find_closest_strike(calls, targets["cf"])
                 
                 if any(x is None for x in [pf_base, pn_base, cn_base, cf_base]):
-                    # Skip if strikes not found
                     continue 
 
                 base_legs = build_legs(pf_base, pn_base, cn_base, cf_base)
@@ -344,26 +343,23 @@ def analyze_custom_strategy(ticker, sentiment, volatility_high, optimize=False):
                         best_ratio = -1.0
                         best_config = None
                         
-                        # Scan range: +/- 2 strikes around the targets
-                        range_scan = range(-2, 3) 
+                        # Scan range: +/- 1 strike around targets to keep it fast for many expiries
+                        range_scan = range(-1, 2) 
                         
                         for i1 in range_scan: # Put Far
                             for i2 in range_scan: # Put Near
                                 for i3 in range_scan: # Call Near
                                     for i4 in range_scan: # Call Far
-                                        # Safety bounds
                                         if not (0 <= pf_idx+i1 < len(puts)): continue
                                         if not (0 <= pn_idx+i2 < len(puts)): continue
                                         if not (0 <= cn_idx+i3 < len(calls)): continue
                                         if not (0 <= cf_idx+i4 < len(calls)): continue
                                         
-                                        # Construct candidate rows
                                         pf_cand = puts.iloc[pf_idx+i1]
                                         pn_cand = puts.iloc[pn_idx+i2]
                                         cn_cand = calls.iloc[cn_idx+i3]
                                         cf_cand = calls.iloc[cf_idx+i4]
                                         
-                                        # Logical Check
                                         if pf_cand['strike'] >= pn_cand['strike']: continue
                                         if cn_cand['strike'] >= cf_cand['strike']: continue
                                         
@@ -383,16 +379,14 @@ def analyze_custom_strategy(ticker, sentiment, volatility_high, optimize=False):
                         
                         payload["optimized"] = best_config
                 
-                # Add successful payload to list
                 results_list.append(payload)
 
             except Exception as e:
-                # Log error for this specific date but continue
                 errors.append(f"Date {target_date}: {str(e)}")
                 continue
 
         if not results_list:
-             return None, "Could not build strategies for any of the next 3 expirations."
+             return None, "Could not build strategies for selected time window."
 
         return results_list, None
 
@@ -403,13 +397,12 @@ def analyze_custom_strategy(ticker, sentiment, volatility_high, optimize=False):
 # PART 3: MAIN APP INTERFACE
 # ==========================================
 
-def display_strategy_details(data, label, current_price, initial_sentiment, initial_vol):
+def display_strategy_details(data, label, current_price):
     """Generates the detailed expander content for a single strategy result."""
     
     st.markdown(f"**{label}**")
     m = data['metrics']
     
-    # Financials
     col1, col2, col3, col4 = st.columns(4)
     net = m['net_premium']
     lbl = "Net Credit" if net > 0 else "Net Debit"
@@ -418,21 +411,18 @@ def display_strategy_details(data, label, current_price, initial_sentiment, init
     col3.metric("Max Profit", f"${m['max_upside']:.2f}")
     col4.metric("Max Loss", f"${abs(m['max_loss']):.2f}")
     
-    # Reward/Risk Ratio
     ratio = m['max_upside'] / abs(m['max_loss']) if abs(m['max_loss']) > 0 else 0
     st.markdown(f"**Reward/Risk Ratio:** `{ratio:.2f}`")
     
     if ratio > 1.0:
         st.success(f"🌟 Sweet Spot: Max Profit > Max Loss!")
-    elif net > 0 and ratio > 0.3:
-        st.info("High probability, low Risk/Reward (Typical Credit Strategy).")
     
-    # Legs Table
     legs_simple = []
     for l in data['legs']:
         legs_simple.append({
             "Action": l['action'], "Type": l['type'], 
-            "Strike": l['row']['strike'], "Price": get_price(l['row'], 'ask' if l['action']=="Buy" else 'bid')
+            "Strike": l['row']['strike'], "Price": get_price(l['row'], 'ask' if l['action']=="Buy" else 'bid'),
+            "Description": l['desc']
         })
     st.dataframe(pd.DataFrame(legs_simple).style.format({"Price": "${:.2f}", "Strike": "${:.2f}"}), use_container_width=True)
 
@@ -440,10 +430,9 @@ def display_strategy_details(data, label, current_price, initial_sentiment, init
 def main():
     st.title("🛡️ Options Strategy Master")
     
-    # --- MASTER SWITCH ---
     mode = st.sidebar.radio(
         "Select Analysis Mode:", 
-        ["Simple Analysis (Standard)", "Custom Strategy Generator (Iron Condor Style)"],
+        ["Simple Analysis (Standard)", "Custom Strategy Generator (Slab Based)"],
         index=0
     )
     st.sidebar.markdown("---")
@@ -455,7 +444,6 @@ def main():
         st.subheader("📈 Multi-Stock Real-Time Analysis")
         st.caption("Fetches live option chains from Yahoo Finance. Standard Spreads/Straddles.")
         
-        # Inputs
         strategy = st.radio("Strategy Type:", ("Bull Call Spread", "Long Straddle"), horizontal=True)
         default_tickers = "NKE, AAPL, AMD, TSLA"
         ticker_input = st.text_input("Enter Tickers (comma-separated):", value=default_tickers)
@@ -479,7 +467,6 @@ def main():
                             all_details[ticker] = df
                         progress_bar.progress((i + 1) / len(tickers))
 
-                # Output
                 st.divider()
                 if all_summaries:
                     st.header("Summary")
@@ -500,60 +487,66 @@ def main():
                         for e in errors: st.write(f"- {e}")
 
     # ==========================================
-    # MODE B: CUSTOM 4-LEG STRATEGY
+    # MODE B: CUSTOM SLAB STRATEGY
     # ==========================================
     else:
-        st.subheader("🤖 Custom 4-Leg Strategy Generator")
-        st.caption("Constructs an optimized 4-leg structure based on your market view.")
+        st.subheader("🤖 Custom Slab-Based Strategy Generator")
+        st.caption("Generates strategies for all expirations within the selected window based on your Strike Slabs.")
         
         # 1. Inputs
         c1, c2 = st.columns(2)
         default_tickers = "TSLA, AAPL, AMD"
         ticker_input = c1.text_input("Stock Tickers (comma-separated)", default_tickers).upper()
-        sentiment = c1.selectbox("Your Sentiment (Applied to All)", ["Bullish", "Bearish"])
-        vol_expect = c2.selectbox("Expect >10% Move?", ["No (Range Bound / <10%)", "Yes (Breakout / >10%)"])
+        sentiment = c1.selectbox("Your Sentiment", ["Bullish", "Bearish"])
         
-        is_high_vol = "Yes" in vol_expect
+        c3, c4 = st.columns(2)
+        days_select = c3.selectbox("Expiration Window", ["Next 30 Days", "Next 60 Days", "Next 90 Days"])
+        days_map = {"Next 30 Days": 30, "Next 60 Days": 60, "Next 90 Days": 90}
+        days_window = days_map[days_select]
         
-        st.info(f"""
-        **Optimization Goal:** Find the highest Reward/Risk ratio for the defined structure and sentiment.
-        - **Target Strikes:** -15%, -8%, +8%, +15% from spot price.
-        - **Scanning:** Next 3 Monthly Expirations.
-        """)
+        c5, c6 = st.columns(2)
+        slab1 = c5.number_input("Slab 1 (Near Strike %)", min_value=1.0, max_value=20.0, value=6.0, step=0.5)
+        slab2 = c6.number_input("Slab 2 (Far Strike %)", min_value=2.0, max_value=30.0, value=10.0, step=0.5)
+        
+        if slab1 >= slab2:
+            st.error("Error: Slab 1 (Near) must be smaller than Slab 2 (Far).")
+            stop = True
+        else:
+            stop = False
 
-        if st.button("Generate & Optimize Strategies"):
+        st.info(f"Generating strategies for **{sentiment}** outlook. Strikes: **±{slab1}%** and **±{slab2}%**.")
+
+        if st.button("Generate Strategies") and not stop:
             if not ticker_input:
                 st.error("Please enter at least one ticker.")
                 return
 
             tickers = [t.strip().upper() for t in ticker_input.split(',') if t.strip()]
-            all_results = {} # Store Key: Ticker, Value: List of Results
+            all_results = {}
             all_summaries = []
             errors = []
 
             progress_bar = st.progress(0)
             
-            with st.spinner(f"Fetching data and optimizing across {len(tickers)} tickers..."):
+            with st.spinner(f"Scanning expirations for {len(tickers)} tickers..."):
                 for i, ticker in enumerate(tickers):
-                    results_list, error = analyze_custom_strategy(ticker, sentiment, is_high_vol, optimize=True)
+                    results_list, error = analyze_custom_strategy(ticker, sentiment, slab1, slab2, days_window, optimize=True)
                     
                     if error:
                         errors.append(f"{ticker}: {error}")
                     else:
                         all_results[ticker] = results_list
                         
-                        # Add ALL expiries to summary
                         for res in results_list:
-                            metrics = res['optimized']['metrics']
-                            ratio = res['optimized']['ratio']
+                            metrics = res['optimized']['metrics'] if res['optimized'] else res['base']['metrics']
+                            ratio = res['optimized']['ratio'] if res['optimized'] else (res['base']['metrics']['max_upside'] / abs(res['base']['metrics']['max_loss']))
                             
                             summary_data = {
                                 "Stock": ticker,
-                                "Expiry Date": res['expiry'],
-                                "Spot Price": f"${res['current_price']:.2f}",
+                                "Expiry": res['expiry'],
+                                "Spot": f"${res['current_price']:.2f}",
                                 "Net Premium": f"${metrics['net_premium']:.2f}",
                                 "Max Profit": f"${metrics['max_upside']:.2f}",
-                                "Max Loss": f"${abs(metrics['max_loss']):.2f}",
                                 "Reward/Risk": f"{ratio:.2f}"
                             }
                             all_summaries.append(summary_data)
@@ -564,46 +557,24 @@ def main():
             st.divider()
             
             if all_summaries:
-                st.header("1. Strategy Summary (Optimized Results)")
+                st.header("1. Strategy Summary (Optimized)")
                 summary_df = pd.DataFrame(all_summaries)
-                cols = ["Stock", "Expiry Date", "Spot Price", "Net Premium", "Max Profit", "Max Loss", "Reward/Risk"]
-                summary_df = summary_df[cols]
                 st.dataframe(summary_df, hide_index=True, use_container_width=True)
 
-                st.header("2. Detailed Trade Structure & P&L")
+                st.header("2. Detailed Trade Analysis")
                 
                 for ticker, results_list in all_results.items():
                     st.markdown(f"### {ticker}")
                     for res in results_list:
-                        with st.expander(f"📅 {res['expiry']} | Optimized R/R {res['optimized']['ratio']:.2f}", expanded=False):
-                            
-                            base_ratio = res['base']['metrics']['max_upside'] / abs(res['base']['metrics']['max_loss'])
-                            opt_ratio = res['optimized']['ratio']
-
-                            if opt_ratio > base_ratio:
-                                st.info(f"Optimization improved R/R from {base_ratio:.2f} to {opt_ratio:.2f}.")
-
-                            display_strategy_details(
-                                res['optimized'], 
-                                f"Recommended Optimized Strategy", 
-                                res['current_price'],
-                                sentiment,
-                                is_high_vol
-                            )
-                            
-                            with st.expander("Show Base Strategy (Fixed Targets)"):
-                                display_strategy_details(
-                                    res['base'], 
-                                    f"Base Strategy", 
-                                    res['current_price'],
-                                    sentiment,
-                                    is_high_vol
-                                )
+                        opt_data = res['optimized'] if res['optimized'] else res['base']
+                        ratio = opt_data['metrics']['max_upside'] / abs(opt_data['metrics']['max_loss'])
+                        
+                        with st.expander(f"📅 {res['expiry']} | R/R {ratio:.2f}", expanded=False):
+                            display_strategy_details(opt_data, "Recommended Strategy", res['current_price'])
 
             if errors:
                 with st.expander("Errors / Skipped Tickers"):
-                    for err in errors:
-                        st.write(f"- {err}")
+                    for err in errors: st.write(f"- {err}")
 
 if __name__ == "__main__":
     main()
