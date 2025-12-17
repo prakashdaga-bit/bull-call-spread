@@ -14,6 +14,17 @@ from typing import List, Optional, Dict, Union
 st.set_page_config(page_title="Options Strategy Master", page_icon="📈", layout="wide")
 
 # ==========================================
+# TICKER PRESETS
+# ==========================================
+def get_ticker_presets():
+    return {
+        "Custom / Manual Input": "",
+        "Magnificent 7": "NVDA, MSFT, AAPL, GOOGL, AMZN, META, TSLA",
+        "ARK Innovation (Top 25)": "TSLA, COIN, ROKU, PLTR, SQ, RBLX, CRSP, PATH, SHOP, U, DKNG, TDOC, HOOD, ZM, TWLO, NTLA, EXAS, BEAM, PACB, VCYT, DNA, RXRX, PD, ADPT, TXG",
+        "NASDAQ 100 (Top 25)": "AAPL, MSFT, NVDA, AMZN, GOOGL, META, AVGO, TSLA, GOOG, COST, AMD, NFLX, PEP, ADBE, LIN, CSCO, TMUS, QCOM, INTC, AMGN, INTU, TXN, CMCSA, AMAT, HON"
+    }
+
+# ==========================================
 # SHARED HELPER FUNCTIONS (Real Data)
 # ==========================================
 
@@ -436,6 +447,14 @@ def main():
         index=0
     )
     st.sidebar.markdown("---")
+    
+    # Init Session State for Ticker Inputs if not present
+    if "input_simple" not in st.session_state:
+        st.session_state["input_simple"] = "NKE, AAPL, AMD, TSLA"
+    if "input_custom" not in st.session_state:
+        st.session_state["input_custom"] = "TSLA, AAPL, AMD"
+
+    presets = get_ticker_presets()
 
     # ==========================================
     # MODE A: SIMPLE ANALYSIS
@@ -444,9 +463,18 @@ def main():
         st.subheader("📈 Multi-Stock Real-Time Analysis")
         st.caption("Fetches live option chains from Yahoo Finance. Standard Spreads/Straddles.")
         
+        # Inputs
         strategy = st.radio("Strategy Type:", ("Bull Call Spread", "Long Straddle"), horizontal=True)
-        default_tickers = "NKE, AAPL, AMD, TSLA"
-        ticker_input = st.text_input("Enter Tickers (comma-separated):", value=default_tickers)
+        
+        # Preset Loader
+        def on_preset_simple_change():
+            sel = st.session_state.preset_simple
+            if sel != "Custom / Manual Input":
+                st.session_state.input_simple = presets[sel]
+
+        c1, c2 = st.columns([1, 2])
+        c1.selectbox("Quick Load Preset", list(presets.keys()), key="preset_simple", on_change=on_preset_simple_change)
+        ticker_input = c2.text_input("Enter Tickers (comma-separated):", key="input_simple")
         
         if st.button("Analyze Real-Time Data"):
             if not ticker_input:
@@ -495,8 +523,16 @@ def main():
         
         # 1. Inputs
         c1, c2 = st.columns(2)
-        default_tickers = "TSLA, AAPL, AMD"
-        ticker_input = c1.text_input("Stock Tickers (comma-separated)", default_tickers).upper()
+        
+        # Preset Loader
+        def on_preset_custom_change():
+            sel = st.session_state.preset_custom
+            if sel != "Custom / Manual Input":
+                st.session_state.input_custom = presets[sel]
+
+        c1.selectbox("Quick Load Preset", list(presets.keys()), key="preset_custom", on_change=on_preset_custom_change)
+        ticker_input = c1.text_input("Stock Tickers (comma-separated)", key="input_custom").upper()
+        
         sentiment = c1.selectbox("Your Sentiment", ["Bullish", "Bearish"])
         
         c3, c4 = st.columns(2)
