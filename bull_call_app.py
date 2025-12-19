@@ -303,8 +303,8 @@ def analyze_custom_strategy(ticker, sentiment, slab1_pct, slab2_pct, days_window
                         l = [
                             {"type": "Put", "action": "Buy", "row": pf_row, "desc": f"Put Long (-{slab2_pct}%)"},
                             {"type": "Put", "action": "Sell", "row": pn_row, "desc": f"Put Short (-{slab1_pct}%)"},
-                            {"type": "Call", "action": "Buy", "row": cn_row, "desc": f"Call Long (+{slab1_pct}%)"},
-                            {"type": "Call", "action": "Sell", "row": cf_row, "desc": f"Call Short (+{slab2_pct}%)"},
+                            {"type": "Call", "action": "Sell", "row": cn_row, "desc": f"Call Long (+{slab1_pct}%)"},
+                            {"type": "Call", "action": "Buy", "row": cf_row, "desc": f"Call Short (+{slab2_pct}%)"},
                         ]
                     else: # Bearish
                         # Bearish Logic: Inverted Bullish
