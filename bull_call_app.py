@@ -33,7 +33,7 @@ def get_next_earnings_date(ticker_obj):
     try:
         # Try retrieving calendar
         cal = ticker_obj.calendar
-        if cal is not None and not isinstance(cal, list) and not cal.empty:
+        if cal is not None and not isinstance(cal, list) and bool(cal):
             # yfinance calendar structure varies; typically 'Earnings Date' row or column
             # Check if dict-like or dataframe
             if isinstance(cal, dict) and 'Earnings Date' in cal:
@@ -50,14 +50,14 @@ def get_next_earnings_date(ticker_obj):
         
         # Fallback method: get_earnings_dates
         dates_df = ticker_obj.get_earnings_dates(limit=4)
-        if dates_df is not None and not dates_df.empty:
+        if dates_df is not None and not bool(dates_df):
             future_dates = dates_df[dates_df.index > pd.Timestamp.now()]
             if not future_dates.empty:
                 return future_dates.index[-1].strftime('%Y-%m-%d') # Often sorted desc
             
-        return "N/A Daga"
+        return "N/A "
     except:
-        return "N/A Prakash"
+        return "N/A "
 
 def get_expirations_within_days(ticker_obj, days_limit=30):
     """Returns all expiration dates within the next X days."""
