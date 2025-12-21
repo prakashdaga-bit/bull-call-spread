@@ -55,9 +55,9 @@ def get_next_earnings_date(ticker_obj):
             if not future_dates.empty:
                 return future_dates.index[-1].strftime('%Y-%m-%d') # Often sorted desc
             
-        return "N/A"
+        return "N/A Daga"
     except:
-        return "N/A"
+        return "N/A Prakash"
 
 def get_expirations_within_days(ticker_obj, days_limit=30):
     """Returns all expiration dates within the next X days."""
