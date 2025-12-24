@@ -63,13 +63,18 @@ class NSEMarketAdapter:
     
     def __init__(self):
         self.session = requests.Session()
+        # Enhanced Headers to mimic real browser and avoid 401/403
         self.session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "*/*",
             "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br"
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Referer": "https://www.nseindia.com/option-chain"
         })
         try:
-            self.session.get(self.BASE_URL, timeout=5)
+            # Prime the cookies by visiting main page first
+            self.session.get(self.BASE_URL, timeout=10)
         except: pass
 
     def get_spot_price(self, ticker):
@@ -89,40 +94,76 @@ class NSEMarketAdapter:
         except: return None
 
     def fetch_option_chain_raw(self, ticker):
-        url = f"https://www.nseindia.com/api/option-chain-indices?symbol={ticker}" if ticker in self.INDICES else f"https://www.nseindia.com/api/option-chain-equities?symbol={ticker}"
+        # Determine URL
+        if ticker in self.INDICES:
+            url = f"https://www.nseindia.com/api/option-chain-indices?symbol={ticker}"
+        else:
+            # Ensure symbol is URL encoded properly if needed, usually simple upper case works
+            url = f"https://www.nseindia.com/api/option-chain-equities?symbol={ticker.upper()}"
+            
         try:
             response = self.session.get(url, timeout=10)
+            
             if response.status_code == 401:
+                # Refresh session cookies
                 self.session.get(self.BASE_URL)
                 response = self.session.get(url, timeout=10)
-            if response.status_code == 200: return response.json()
-        except: return None
-        return None
+            
+            if response.status_code == 200:
+                return response.json()
+            else:
+                print(f"NSE Fetch Error: Status {response.status_code} for {url}")
+                return None
+        except Exception as e:
+            print(f"NSE Exception: {e}")
+            return None
 
     def get_expirations(self, ticker, days_limit=90):
         data = self.fetch_option_chain_raw(ticker)
-        if not data or 'records' not in data: return [], None
+        if not data or 'records' not in data:
+            return [], None
+            
         expiry_dates = data['records']['expiryDates']
         valid_dates = []
         today = datetime.date.today()
         limit = today + datetime.timedelta(days=days_limit)
+        
         for d_str in expiry_dates:
             try:
                 d = datetime.datetime.strptime(d_str, "%d-%b-%Y").date()
-                if today <= d <= limit: valid_dates.append(d_str)
-            except: continue
+                if today <= d <= limit:
+                    valid_dates.append(d_str)
+            except:
+                continue
         return valid_dates, data
 
     def parse_chain(self, raw_data, expiry_date_str):
-        if not raw_data or 'records' not in raw_data: return pd.DataFrame(), pd.DataFrame()
+        if not raw_data or 'records' not in raw_data:
+            return pd.DataFrame(), pd.DataFrame()
+            
         data = raw_data['records']['data']
         calls_list, puts_list = [], []
+        
         for item in data:
-            if item['expiryDate'] != expiry_date_str: continue
+            if item['expiryDate'] != expiry_date_str:
+                continue
+                
             if 'CE' in item:
-                calls_list.append({'strike': item['CE']['strikePrice'], 'lastPrice': item['CE']['lastPrice'], 'bid': item['CE']['bidprice'], 'ask': item['CE']['askPrice'], 'openInterest': item['CE']['openInterest']})
+                calls_list.append({
+                    'strike': item['CE']['strikePrice'],
+                    'lastPrice': item['CE']['lastPrice'],
+                    'bid': item['CE']['bidprice'],
+                    'ask': item['CE']['askPrice'],
+                    'openInterest': item['CE']['openInterest']
+                })
             if 'PE' in item:
-                puts_list.append({'strike': item['PE']['strikePrice'], 'lastPrice': item['PE']['lastPrice'], 'bid': item['PE']['bidprice'], 'ask': item['PE']['askPrice'], 'openInterest': item['PE']['openInterest']})
+                puts_list.append({
+                    'strike': item['PE']['strikePrice'],
+                    'lastPrice': item['PE']['lastPrice'],
+                    'bid': item['PE']['bidprice'],
+                    'ask': item['PE']['askPrice'],
+                    'openInterest': item['PE']['openInterest']
+                })
         return pd.DataFrame(calls_list), pd.DataFrame(puts_list)
 
 class ZerodhaMarketAdapter:
@@ -154,14 +195,15 @@ class ZerodhaMarketAdapter:
         return pd.DataFrame(_self.kite.instruments("NFO"))
 
     def get_spot_price(self, ticker):
-        # Fallback to Yahoo for Spot price to save API calls or complex logic
-        # Or fetch from NSE equity if needed. Using Yahoo for simplicity as it's free.
-        # Mapping for indices
+        # Fallback to Yahoo for Spot price
         idx_map = {"NIFTY": "^NSEI", "BANKNIFTY": "^NSEBANK", "FINNIFTY": "NIFTY_FIN_SERVICE.NS"}
         yf_ticker = idx_map.get(ticker, f"{ticker}.NS")
         try:
             stock = yf.Ticker(yf_ticker)
             price = stock.fast_info['last_price']
+            if price is None:
+                hist = stock.history(period="1d")
+                if not hist.empty: price = hist['Close'].iloc[-1]
             return price
         except: return None
 
@@ -169,8 +211,6 @@ class ZerodhaMarketAdapter:
         if self.instruments is None:
             self.instruments = self.get_instruments()
             
-        # Filter instruments for this ticker
-        # Zerodha names: "NIFTY" or "INFY"
         df = self.instruments
         
         # Handle Indices vs Stocks
@@ -196,14 +236,11 @@ class ZerodhaMarketAdapter:
         return unique_dates, valid_subset
 
     def fetch_quotes(self, instrument_tokens):
-        # Zerodha allows multi-quote. 
-        # Batches of 500? Check documentation. 
-        # For simplicity, passing list directly.
         try:
             quotes = self.kite.quote(instrument_tokens)
             return quotes
         except Exception as e:
-            st.error(f"Quote Fetch Error: {e}")
+            # st.error(f"Quote Fetch Error: {e}")
             return {}
 
     def parse_chain(self, valid_instruments, expiry_date):
@@ -216,7 +253,6 @@ class ZerodhaMarketAdapter:
         tokens = expiry_subset['instrument_token'].tolist()
         
         # Fetch Quotes
-        # Ideally batch this if huge
         quotes = self.fetch_quotes(tokens)
         
         calls_list = []
@@ -224,15 +260,14 @@ class ZerodhaMarketAdapter:
         
         for _, row in expiry_subset.iterrows():
             token = row['instrument_token']
-            if token not in quotes: continue
+            # ROBUST CHECK: Try both int and string key lookup
+            q = quotes.get(token) or quotes.get(str(token))
             
-            q = quotes[token]
+            if not q: continue
+            
             depth = q.get('depth', {})
             buy = depth.get('buy', [{}])[0]
             sell = depth.get('sell', [{}])[0]
-            
-            # Zerodha Quote Structure: 
-            # last_price, depth: {buy: [{price, quantity, orders}], sell: ...}
             
             data = {
                 'strike': row['strike'],
@@ -256,7 +291,7 @@ class ZerodhaMarketAdapter:
 def get_monthly_expirations(ticker_obj, limit=3):
     """
     Filters the list of expiration dates to find the next 'limit' distinct months.
-    Used for Simple Analysis (USA) to match original logic.
+    Used for Simple Analysis (USA).
     """
     try:
         expirations = ticker_obj.options
@@ -312,17 +347,13 @@ def get_next_earnings_date(ticker_obj):
         # Try retrieving calendar
         cal = ticker_obj.calendar
         if cal is not None and not isinstance(cal, list) and bool(cal):
-            # yfinance calendar structure varies; typically 'Earnings Date' row or column
-            # Check if dict-like or dataframe
             if isinstance(cal, dict) and 'Earnings Date' in cal:
                 dates = cal['Earnings Date']
                 if dates:
                     return dates[0].strftime('%Y-%m-%d')
             elif isinstance(cal, pd.DataFrame):
-                # Try finding row 'Earnings Date'
                 if 'Earnings Date' in cal.index:
                     vals = cal.loc['Earnings Date']
-                    # vals might be a Series or list
                     if hasattr(vals, 'iloc'):
                         return vals.iloc[0].strftime('%Y-%m-%d')
         
@@ -331,7 +362,7 @@ def get_next_earnings_date(ticker_obj):
         if dates_df is not None and len(dates_df) > 0:
             future_dates = dates_df[dates_df.index > pd.Timestamp.now()]
             if not future_dates.empty:
-                return future_dates.index[-1].strftime('%Y-%m-%d') # Often sorted desc
+                return future_dates.index[-1].strftime('%Y-%m-%d')
             
         return "N/A"
     except:
@@ -425,7 +456,7 @@ def fetch_and_analyze_ticker_hybrid(ticker, strategy_type, region="USA", source=
         else:
             stock = yf.Ticker(ticker)
             try:
-                # REVERTED TO ORIGINAL MONTHLY LOGIC FOR USA SIMPLE ANALYSIS
+                # Use Monthly Logic for Simple Analysis
                 valid_dates = get_monthly_expirations(stock, limit=3)
             except: pass
 
@@ -606,8 +637,6 @@ def analyze_custom_strategy(ticker, view, slab1_pct, slab2_pct, days_window, reg
         if region == "India":
             clean_ticker = ticker.replace(".NS", "")
             current_price = adapter.get_spot_price(clean_ticker)
-            # Earnings is messy from non-Yahoo sources, defaulting to Yahoo lookup even in India mode
-            # unless using NSE scraper specifically? Let's stick to Yahoo for ease.
             try:
                 stock = yf.Ticker(f"{clean_ticker}.NS")
                 earnings_date = get_next_earnings_date(stock)
