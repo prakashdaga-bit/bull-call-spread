@@ -26,13 +26,37 @@ jobs:
         run: |
           pip install selenium pyotp kiteconnect webdriver-manager
 
-      - name: Check File Existence
+      - name: Debug Secrets & Environment
+        env:
+          CHECK_API: ${{ secrets.ZERODHA_API_KEY }}
+          CHECK_USER: ${{ secrets.ZERODHA_USER_ID }}
+          CHECK_PASS: ${{ secrets.ZERODHA_PASSWORD }}
         run: |
+          echo "=== Debugging Environment ==="
           ls -R
-          if [ ! -f "zerodha_auto_token.py" ]; then
-            echo "Error: zerodha_auto_token.py not found!"
+          echo "Checking Chrome..."
+          google-chrome --version
+          
+          echo "Checking Secrets..."
+          if [ -z "$CHECK_API" ]; then
+            echo "::error::ZERODHA_API_KEY is missing or empty!"
             exit 1
           fi
+          if [ -z "$CHECK_USER" ]; then
+            echo "::error::ZERODHA_USER_ID is missing or empty!"
+            exit 1
+          fi
+          if [ -z "$CHECK_PASS" ]; then
+            echo "::error::ZERODHA_PASSWORD is missing or empty!"
+            exit 1
+          fi
+          echo "✅ All required secrets appear to be present."
+          
+          if [ ! -f "zerodha_auto_token.py" ]; then
+            echo "::error::zerodha_auto_token.py not found in the root directory!"
+            exit 1
+          fi
+          echo "✅ zerodha_auto_token.py found."
 
       - name: Run Token Generator
         env:
