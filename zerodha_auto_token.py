@@ -11,6 +11,7 @@ from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.keys import Keys
 
 # ==========================================
 # CONFIGURATION
@@ -30,7 +31,7 @@ def clean_base32_key(key):
     return key
 
 def generate_token():
-    print("🚀 Starting Auto-Login Script V2.6 (Deep Diagnostics)...")
+    print("🚀 Starting Auto-Login Script V2.7 (TOTP Brute-Force)...")
     
     # 1. Setup Data
     if not totp_secret:
@@ -72,50 +73,76 @@ def generate_token():
         driver.find_element(By.XPATH, "//button[@type='submit']").click()
         
         print("📍 Step 3: Entering TOTP...")
-        try:
-            # Flexible wait for any input field
-            totp_field = wait.until(EC.visibility_of_element_located((By.XPATH, "//input[@type='text' or @type='number' or @type='tel']")))
-        except:
-            # Fallback for weird ID reuse
-            totp_field = driver.find_element(By.ID, "userid")
+        time.sleep(3) # Wait for TOTP page load
         
-        totp_field.send_keys(token_now)
-        
-        # Robust button click
-        try:
-            driver.find_element(By.XPATH, "//button[@type='submit']").click()
-        except:
-            driver.execute_script("document.querySelector('button[type=submit]').click();")
+        # Check if we are on the TOTP page
+        page_source = driver.page_source.lower()
+        if "external totp" in page_source or "authenticator" in page_source:
+            print("ℹ️  TOTP Page Detected.")
+            
+            # Strategy: Find ANY visible input field and type in it
+            inputs = driver.find_elements(By.TAG_NAME, "input")
+            typed = False
+            for inp in inputs:
+                try:
+                    if inp.is_displayed() and inp.is_enabled():
+                        inp_type = inp.get_attribute("type")
+                        if inp_type in ["text", "number", "tel", "password"]:
+                            inp.clear()
+                            inp.send_keys(token_now)
+                            print(f"✅ Typed TOTP into input (Type: {inp_type})")
+                            typed = True
+                            break # Assume only one main input on this page
+                except: continue
+            
+            if not typed:
+                print("❌ Could not find a visible input field for TOTP.")
+                print(f"DEBUG: Page Inputs: {[i.get_attribute('outerHTML') for i in inputs]}")
+                raise Exception("TOTP Input missing.")
+
+            # Strategy: Find "Continue" button
+            try:
+                # Try finding button by text
+                buttons = driver.find_elements(By.TAG_NAME, "button")
+                clicked_btn = False
+                for btn in buttons:
+                    if "continue" in btn.text.lower() or "submit" in btn.type:
+                        btn.click()
+                        print(f"✅ Clicked button: '{btn.text}'")
+                        clicked_btn = True
+                        break
+                
+                if not clicked_btn:
+                    # Fallback: Hit Enter in the input field
+                    print("⚠️ Button not found. Hitting ENTER key...")
+                    driver.switch_to.active_element.send_keys(Keys.RETURN)
+            except Exception as e:
+                print(f"⚠️ Button click failed: {e}")
+
+        else:
+            print("⚠️ Warning: Did not detect standard TOTP page text. Checking if already logged in...")
+
         
         # 4. Handle Post-Login Logic
         print("📍 Step 4: Waiting for Redirect/Authorize...")
-        time.sleep(8) # Increased wait time
+        time.sleep(8) 
         
-        # Check if still on Zerodha domain (Redirect failed or pending)
+        # Check if still on Zerodha domain
         if "zerodha.com" in driver.current_url:
             print("ℹ️  Still on Zerodha domain. Investigating page content...")
-            
             try:
                 body_text = driver.find_element(By.TAG_NAME, "body").text.lower()
-                print(f"📄 Page Content Snippet: {body_text[:200]}...") # Print first 200 chars to debug
                 
-                # Check for specific errors
                 if "invalid redirect" in body_text:
                     print("❌ ERROR: Zerodha says 'Invalid Redirect URL'.")
                     print("👉 FIX: Go to Kite Developer Console > My Apps > Edit App. Set Redirect URL to 'http://localhost'")
                     exit(1)
                 
-                # Check for Authorize
                 if "authorize" in body_text or "allow" in body_text:
                     print("ℹ️  'Authorize' screen detected. Clicking submit...")
-                    try:
-                        driver.find_element(By.XPATH, "//button[@type='submit']").click()
-                        print("✅ Clicked Authorize.")
-                        time.sleep(5)
-                    except:
-                        print("⚠️ Could not click Authorize automatically.")
-            except:
-                print("⚠️ Could not extract page text.")
+                    driver.find_element(By.XPATH, "//button[@type='submit']").click()
+                    time.sleep(5)
+            except: pass
 
         # 5. Extract Token
         current_url = driver.current_url
@@ -145,7 +172,9 @@ def generate_token():
         else:
             print(f"❌ Final URL: {current_url}")
             try:
-                print(f"Debug Title: {driver.title}")
+                # Dump page text for debugging
+                print("DEBUG PAGE DUMP:")
+                print(driver.find_element(By.TAG_NAME, "body").text[:500])
             except: pass
             raise Exception("No request_token in URL.")
             
