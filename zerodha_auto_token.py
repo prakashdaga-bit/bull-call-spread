@@ -4,6 +4,7 @@ import pyotp
 import base64
 import binascii
 from kiteconnect import KiteConnect
+import kiteconnect.exceptions
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.service import Service
@@ -29,7 +30,7 @@ def clean_base32_key(key):
     return key
 
 def generate_token():
-    print("🚀 Starting Auto-Login Script V2.4 (Robust TOTP)...")
+    print("🚀 Starting Auto-Login Script V2.5 (Secret Debugger)...")
     
     # 1. Setup Data
     if not totp_secret:
@@ -70,34 +71,21 @@ def generate_token():
         driver.find_element(By.ID, "password").send_keys(password)
         driver.find_element(By.XPATH, "//button[@type='submit']").click()
         
-        print("📍 Step 3: Handling TOTP...")
-        # Wait for page transition to TOTP screen
+        print("📍 Step 3: Entering TOTP...")
         try:
-            wait.until(EC.presence_of_element_located((By.XPATH, "//*[contains(text(), 'External TOTP') or contains(text(), 'Authenticator')]")))
+            # Flexible wait for any input field
+            totp_field = wait.until(EC.visibility_of_element_located((By.XPATH, "//input[@type='text' or @type='number' or @type='tel']")))
         except:
-            print("⚠️  Warning: Specific TOTP page marker not found, trying to find input anyway...")
-
-        # Find the input field (Robust Locator)
+            # Fallback for weird ID reuse
+            totp_field = driver.find_element(By.ID, "userid")
+        
+        totp_field.send_keys(token_now)
+        
+        # Robust button click
         try:
-            # Look for any visible input that is text/number/tel (Zerodha varies this)
-            totp_field = wait.until(EC.element_to_be_clickable((By.XPATH, "//input[@type='text' or @type='number' or @type='tel']")))
-            totp_field.clear()
-            totp_field.send_keys(token_now)
-            print("✅ Entered TOTP Code.")
-        except Exception as e:
-            print(f"❌ Could not find TOTP input field. Error: {e}")
-            raise e
-
-        # Click Continue
-        try:
-            # Look specifically for the "Continue" button text first
-            continue_btn = driver.find_element(By.XPATH, "//button[contains(normalize-space(), 'Continue')]")
-            continue_btn.click()
-            print("✅ Clicked 'Continue'.")
-        except:
-            # Fallback to generic submit
-            print("⚠️  'Continue' button not found, trying generic submit...")
             driver.find_element(By.XPATH, "//button[@type='submit']").click()
+        except:
+            driver.execute_script("document.querySelector('button[type=submit]').click();")
         
         # 4. Handle Post-Login Logic
         print("📍 Step 4: Waiting for Redirect/Authorize...")
@@ -122,19 +110,29 @@ def generate_token():
             print(f"✅ Request Token Found: {request_token[:6]}...")
             
             print("📍 Step 5: Generating Access Token...")
-            data = kite.generate_session(request_token, api_secret=api_secret)
-            access_token = data["access_token"]
+            try:
+                data = kite.generate_session(request_token, api_secret=api_secret)
+                access_token = data["access_token"]
+                
+                with open("zerodha_token.txt", "w") as f:
+                    f.write(f"{api_key},{access_token}")
+                
+                print(f"🎉 SUCCESS! Token saved.")
+                
+            except kiteconnect.exceptions.TokenException as e:
+                print(f"❌ AUTH ERROR: {e}")
+                print("👉 MOST LIKELY CAUSE: Your 'ZERODHA_API_SECRET' in GitHub Secrets is incorrect.")
+                print("👉 Action: Check Developer Portal -> My Apps -> API Secret. It is NOT the same as API Key.")
+                exit(1)
+            except Exception as e:
+                print(f"❌ API ERROR: {e}")
+                exit(1)
             
-            with open("zerodha_token.txt", "w") as f:
-                f.write(f"{api_key},{access_token}")
-            
-            print(f"🎉 SUCCESS! Token saved.")
         else:
-            # Debug snapshot if it fails again
             print(f"❌ Final URL: {current_url}")
             try:
-                body_text = driver.find_element(By.TAG_NAME, "body").text
-                print(f"📄 Page Text Dump:\n{body_text[:300]}...")
+                # Debug print only if failed
+                print(f"Debug Title: {driver.title}")
             except: pass
             raise Exception("No request_token in URL.")
             
