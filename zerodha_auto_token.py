@@ -30,7 +30,7 @@ def clean_base32_key(key):
     return key
 
 def generate_token():
-    print("🚀 Starting Auto-Login Script V2.5 (Secret Debugger)...")
+    print("🚀 Starting Auto-Login Script V2.6 (Deep Diagnostics)...")
     
     # 1. Setup Data
     if not totp_secret:
@@ -89,18 +89,33 @@ def generate_token():
         
         # 4. Handle Post-Login Logic
         print("📍 Step 4: Waiting for Redirect/Authorize...")
-        time.sleep(5) 
+        time.sleep(8) # Increased wait time
         
-        # Check if stuck on Authorize screen
+        # Check if still on Zerodha domain (Redirect failed or pending)
         if "zerodha.com" in driver.current_url:
-            if "Authorize" in driver.page_source:
-                print("ℹ️  'Authorize' screen detected. Clicking...")
-                try:
-                    driver.find_element(By.XPATH, "//button[@type='submit']").click()
-                    print("✅ Clicked Authorize.")
-                    time.sleep(3)
-                except:
-                    print("⚠️ Could not click Authorize automatically.")
+            print("ℹ️  Still on Zerodha domain. Investigating page content...")
+            
+            try:
+                body_text = driver.find_element(By.TAG_NAME, "body").text.lower()
+                print(f"📄 Page Content Snippet: {body_text[:200]}...") # Print first 200 chars to debug
+                
+                # Check for specific errors
+                if "invalid redirect" in body_text:
+                    print("❌ ERROR: Zerodha says 'Invalid Redirect URL'.")
+                    print("👉 FIX: Go to Kite Developer Console > My Apps > Edit App. Set Redirect URL to 'http://localhost'")
+                    exit(1)
+                
+                # Check for Authorize
+                if "authorize" in body_text or "allow" in body_text:
+                    print("ℹ️  'Authorize' screen detected. Clicking submit...")
+                    try:
+                        driver.find_element(By.XPATH, "//button[@type='submit']").click()
+                        print("✅ Clicked Authorize.")
+                        time.sleep(5)
+                    except:
+                        print("⚠️ Could not click Authorize automatically.")
+            except:
+                print("⚠️ Could not extract page text.")
 
         # 5. Extract Token
         current_url = driver.current_url
@@ -122,7 +137,6 @@ def generate_token():
             except kiteconnect.exceptions.TokenException as e:
                 print(f"❌ AUTH ERROR: {e}")
                 print("👉 MOST LIKELY CAUSE: Your 'ZERODHA_API_SECRET' in GitHub Secrets is incorrect.")
-                print("👉 Action: Check Developer Portal -> My Apps -> API Secret. It is NOT the same as API Key.")
                 exit(1)
             except Exception as e:
                 print(f"❌ API ERROR: {e}")
@@ -131,7 +145,6 @@ def generate_token():
         else:
             print(f"❌ Final URL: {current_url}")
             try:
-                # Debug print only if failed
                 print(f"Debug Title: {driver.title}")
             except: pass
             raise Exception("No request_token in URL.")
