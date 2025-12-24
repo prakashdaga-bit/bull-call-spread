@@ -5,6 +5,8 @@ import datetime
 import time
 import random
 import math
+import requests
+import os
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Union
 
@@ -16,16 +18,239 @@ st.set_page_config(page_title="Options Strategy Master", page_icon="📈", layou
 # ==========================================
 # TICKER PRESETS
 # ==========================================
-def get_ticker_presets():
-    return {
-        "Custom / Manual Input": "",
-        "Magnificent 7": "NVDA, MSFT, AAPL, GOOGL, AMZN, META, TSLA",
-        "ARK Innovation (Top 25)": "TSLA, COIN, ROKU, PLTR, SQ, RBLX, CRSP, PATH, SHOP, U, DKNG, TDOC, HOOD, ZM, TWLO, NTLA, EXAS, BEAM, PACB, VCYT, DNA, RXRX, PD, ADPT, TXG",
-        "NASDAQ 100 (Top 25)": "AAPL, MSFT, NVDA, AMZN, GOOGL, META, AVGO, TSLA, GOOG, COST, AMD, NFLX, PEP, ADBE, LIN, CSCO, TMUS, QCOM, INTC, AMGN, INTU, TXN, CMCSA, AMAT, HON"
-    }
+def get_ticker_presets(region="USA"):
+    if region == "USA":
+        return {
+            "Custom / Manual Input": "",
+            "Magnificent 7": "NVDA, MSFT, AAPL, GOOGL, AMZN, META, TSLA",
+            "ARK Innovation (Top 25)": "TSLA, COIN, ROKU, PLTR, SQ, RBLX, CRSP, PATH, SHOP, U, DKNG, TDOC, HOOD, ZM, TWLO, NTLA, EXAS, BEAM, PACB, VCYT, DNA, RXRX, PD, ADPT, TXG",
+            "NASDAQ 100 (Top 25)": "AAPL, MSFT, NVDA, AMZN, GOOGL, META, AVGO, TSLA, GOOG, COST, AMD, NFLX, PEP, ADBE, LIN, CSCO, TMUS, QCOM, INTC, AMGN, INTU, TXN, CMCSA, AMAT, HON"
+        }
+    else:
+        return {
+            "Custom / Manual Input": "",
+            "NIFTY 50 Top 10": "RELIANCE, TCS, HDFCBANK, ICICIBANK, INFY, ITC, SBIN, BHARTIARTL, HINDUNILVR, LTIM",
+            "Indices": "NIFTY, BANKNIFTY, FINNIFTY",
+            "Auto Sector": "TATAMOTORS, M&M, MARUTI, BAJAJ-AUTO, HEROMOTOCO, EICHERMOT"
+        }
 
 # ==========================================
-# SHARED HELPER FUNCTIONS (Real Data)
+# HELPER: LOAD TOKENS FROM FILE
+# ==========================================
+def load_zerodha_tokens():
+    """Reads api_key and access_token from local file if it exists."""
+    if os.path.exists("zerodha_token.txt"):
+        try:
+            with open("zerodha_token.txt", "r") as f:
+                content = f.read().strip()
+                if "," in content:
+                    return content.split(",", 1)
+        except:
+            pass
+    return None, None
+
+# ==========================================
+# MARKET ADAPTERS
+# ==========================================
+
+class NSEMarketAdapter:
+    """
+    Fetches Option Chain data directly from NSE India website.
+    Uses yfinance for Spot Price and Earnings.
+    """
+    BASE_URL = "https://www.nseindia.com"
+    INDICES = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"]
+    
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br"
+        })
+        try:
+            self.session.get(self.BASE_URL, timeout=5)
+        except: pass
+
+    def get_spot_price(self, ticker):
+        yf_ticker = ticker
+        if ticker not in self.INDICES and not ticker.endswith(".NS"):
+            yf_ticker = f"{ticker}.NS"
+        elif ticker in self.INDICES:
+            idx_map = {"NIFTY": "^NSEI", "BANKNIFTY": "^NSEBANK", "FINNIFTY": "NIFTY_FIN_SERVICE.NS"}
+            yf_ticker = idx_map.get(ticker, ticker)
+        try:
+            stock = yf.Ticker(yf_ticker)
+            price = stock.fast_info['last_price']
+            if price is None:
+                hist = stock.history(period="1d")
+                if not hist.empty: price = hist['Close'].iloc[-1]
+            return price
+        except: return None
+
+    def fetch_option_chain_raw(self, ticker):
+        url = f"https://www.nseindia.com/api/option-chain-indices?symbol={ticker}" if ticker in self.INDICES else f"https://www.nseindia.com/api/option-chain-equities?symbol={ticker}"
+        try:
+            response = self.session.get(url, timeout=10)
+            if response.status_code == 401:
+                self.session.get(self.BASE_URL)
+                response = self.session.get(url, timeout=10)
+            if response.status_code == 200: return response.json()
+        except: return None
+        return None
+
+    def get_expirations(self, ticker, days_limit=90):
+        data = self.fetch_option_chain_raw(ticker)
+        if not data or 'records' not in data: return [], None
+        expiry_dates = data['records']['expiryDates']
+        valid_dates = []
+        today = datetime.date.today()
+        limit = today + datetime.timedelta(days=days_limit)
+        for d_str in expiry_dates:
+            try:
+                d = datetime.datetime.strptime(d_str, "%d-%b-%Y").date()
+                if today <= d <= limit: valid_dates.append(d_str)
+            except: continue
+        return valid_dates, data
+
+    def parse_chain(self, raw_data, expiry_date_str):
+        if not raw_data or 'records' not in raw_data: return pd.DataFrame(), pd.DataFrame()
+        data = raw_data['records']['data']
+        calls_list, puts_list = [], []
+        for item in data:
+            if item['expiryDate'] != expiry_date_str: continue
+            if 'CE' in item:
+                calls_list.append({'strike': item['CE']['strikePrice'], 'lastPrice': item['CE']['lastPrice'], 'bid': item['CE']['bidprice'], 'ask': item['CE']['askPrice'], 'openInterest': item['CE']['openInterest']})
+            if 'PE' in item:
+                puts_list.append({'strike': item['PE']['strikePrice'], 'lastPrice': item['PE']['lastPrice'], 'bid': item['PE']['bidprice'], 'ask': item['PE']['askPrice'], 'openInterest': item['PE']['openInterest']})
+        return pd.DataFrame(calls_list), pd.DataFrame(puts_list)
+
+class ZerodhaMarketAdapter:
+    """
+    Uses Kite Connect API to fetch option chains.
+    Requires 'kiteconnect' package: pip install kiteconnect
+    """
+    def __init__(self, api_key, access_token):
+        self.api_key = api_key
+        self.access_token = access_token
+        self.kite = None
+        self.instruments = None
+        
+    def connect(self):
+        try:
+            from kiteconnect import KiteConnect
+            self.kite = KiteConnect(api_key=self.api_key)
+            self.kite.set_access_token(self.access_token)
+            return True
+        except ImportError:
+            st.error("Please install kiteconnect: `pip install kiteconnect`")
+            return False
+        except Exception as e:
+            st.error(f"Zerodha Connection Error: {e}")
+            return False
+
+    @st.cache_data(ttl=3600) # Cache instruments for 1 hour
+    def get_instruments(_self):
+        return pd.DataFrame(_self.kite.instruments("NFO"))
+
+    def get_spot_price(self, ticker):
+        # Fallback to Yahoo for Spot price to save API calls or complex logic
+        # Or fetch from NSE equity if needed. Using Yahoo for simplicity as it's free.
+        # Mapping for indices
+        idx_map = {"NIFTY": "^NSEI", "BANKNIFTY": "^NSEBANK", "FINNIFTY": "NIFTY_FIN_SERVICE.NS"}
+        yf_ticker = idx_map.get(ticker, f"{ticker}.NS")
+        try:
+            stock = yf.Ticker(yf_ticker)
+            price = stock.fast_info['last_price']
+            return price
+        except: return None
+
+    def get_chain_for_symbol(self, ticker, days_limit=90):
+        if self.instruments is None:
+            self.instruments = self.get_instruments()
+            
+        # Filter instruments for this ticker
+        # Zerodha names: "NIFTY" or "INFY"
+        df = self.instruments
+        
+        # Handle Indices vs Stocks
+        name = ticker
+        if ticker == "NIFTY": name = "NIFTY"
+        elif ticker == "BANKNIFTY": name = "BANKNIFTY"
+        elif ticker == "FINNIFTY": name = "FINNIFTY"
+        
+        subset = df[df['name'] == name].copy()
+        if subset.empty: return [], {}
+        
+        # Parse Expiry
+        subset['expiry'] = pd.to_datetime(subset['expiry']).dt.date
+        today = datetime.date.today()
+        limit = today + datetime.timedelta(days=days_limit)
+        
+        valid_subset = subset[(subset['expiry'] >= today) & (subset['expiry'] <= limit)]
+        unique_dates = sorted(valid_subset['expiry'].unique())
+        
+        # Limit to 3
+        unique_dates = unique_dates[:3]
+        
+        return unique_dates, valid_subset
+
+    def fetch_quotes(self, instrument_tokens):
+        # Zerodha allows multi-quote. 
+        # Batches of 500? Check documentation. 
+        # For simplicity, passing list directly.
+        try:
+            quotes = self.kite.quote(instrument_tokens)
+            return quotes
+        except Exception as e:
+            st.error(f"Quote Fetch Error: {e}")
+            return {}
+
+    def parse_chain(self, valid_instruments, expiry_date):
+        # Filter for specific expiry
+        expiry_subset = valid_instruments[valid_instruments['expiry'] == expiry_date]
+        
+        if expiry_subset.empty: return pd.DataFrame(), pd.DataFrame()
+        
+        # Get Tokens
+        tokens = expiry_subset['instrument_token'].tolist()
+        
+        # Fetch Quotes
+        # Ideally batch this if huge
+        quotes = self.fetch_quotes(tokens)
+        
+        calls_list = []
+        puts_list = []
+        
+        for _, row in expiry_subset.iterrows():
+            token = row['instrument_token']
+            if token not in quotes: continue
+            
+            q = quotes[token]
+            depth = q.get('depth', {})
+            buy = depth.get('buy', [{}])[0]
+            sell = depth.get('sell', [{}])[0]
+            
+            # Zerodha Quote Structure: 
+            # last_price, depth: {buy: [{price, quantity, orders}], sell: ...}
+            
+            data = {
+                'strike': row['strike'],
+                'lastPrice': q.get('last_price', 0),
+                'bid': buy.get('price', 0),
+                'ask': sell.get('price', 0),
+                'openInterest': q.get('oi', 0)
+            }
+            
+            if row['instrument_type'] == 'CE':
+                calls_list.append(data)
+            elif row['instrument_type'] == 'PE':
+                puts_list.append(data)
+                
+        return pd.DataFrame(calls_list), pd.DataFrame(puts_list)
+
+# ==========================================
+# SHARED HELPER FUNCTIONS
 # ==========================================
 
 def get_next_earnings_date(ticker_obj):
@@ -50,41 +275,16 @@ def get_next_earnings_date(ticker_obj):
         
         # Fallback method: get_earnings_dates
         dates_df = ticker_obj.get_earnings_dates(limit=4)
-        if dates_df is not None and not bool(dates_df):
+        if dates_df is not None and len(dates_df) > 0:
             future_dates = dates_df[dates_df.index > pd.Timestamp.now()]
             if not future_dates.empty:
                 return future_dates.index[-1].strftime('%Y-%m-%d') # Often sorted desc
             
-        return "N/A "
+        return "N/A"
     except:
-        return "N/A "
-
-def get_expirations_within_days(ticker_obj, days_limit=30):
-    """Returns all expiration dates within the next X days."""
-    try:
-        expirations = ticker_obj.options
-    except:
-        return []
-        
-    if not expirations:
-        return []
-        
-    valid_dates = []
-    today = datetime.date.today()
-    limit_date = today + datetime.timedelta(days=days_limit)
-    
-    for date_str in expirations:
-        try:
-            exp_date = datetime.datetime.strptime(date_str, '%Y-%m-%d').date()
-            if today <= exp_date <= limit_date:
-                valid_dates.append(date_str)
-        except:
-            continue
-            
-    return valid_dates
+        return "N/A"
 
 def filter_tradeable_options(chain):
-    """Filters the option chain to keep only rows where Ask > 0 or LastPrice > 0."""
     if chain.empty: return chain
     cols = chain.columns
     has_ask = 'ask' in cols
@@ -102,10 +302,6 @@ def find_closest_strike(chain, price_target):
     return chain.sort_values('abs_diff').iloc[0]
 
 def get_price(option_row, price_type='mid'):
-    """
-    Returns the price for the option.
-    price_type: 'ask' (buying), 'bid' (selling), or 'mid' (valuing)
-    """
     bid = option_row.get('bid', 0)
     ask = option_row.get('ask', 0)
     last = option_row.get('lastPrice', 0)
@@ -116,7 +312,7 @@ def get_price(option_row, price_type='mid'):
     elif price_type == 'ask':
         return ask if ask > 0 else last
     elif price_type == 'bid':
-        return bid if bid > 0 else (last * 0.95) # Fallback if no bid
+        return bid if bid > 0 else (last * 0.95) 
     return last
 
 def get_option_chain_with_retry(stock, date, retries=3):
@@ -129,51 +325,102 @@ def get_option_chain_with_retry(stock, date, retries=3):
     return None
 
 # ==========================================
-# PART 1: SIMPLE ANALYSIS LOGIC
+# MARKET FACTORY & LOGIC
 # ==========================================
 
 @st.cache_data(ttl=600, show_spinner=False)
-def fetch_and_analyze_ticker(ticker_symbol, strategy_type):
-    """Performs option strategy analysis for a single ticker (Real Data)."""
+def fetch_and_analyze_ticker_hybrid(ticker, strategy_type, region="USA", source="Yahoo", z_api=None, z_token=None):
+    """Handles logic for USA (Yahoo) and India (NSE Scraper OR Zerodha)."""
+    
+    # 1. Setup Adapter
+    adapter = None
+    if region == "India":
+        if source == "Zerodha (API)":
+            adapter = ZerodhaMarketAdapter(z_api, z_token)
+            if not adapter.connect(): return None, None, "Zerodha Connection Failed"
+        else:
+            adapter = NSEMarketAdapter()
+    
     try:
-        stock = yf.Ticker(ticker_symbol)
-        try:
-            cmp = stock.fast_info['last_price']
-            if cmp is None: raise ValueError("Fast info returned None")
-        except:
-            hist = stock.history(period='1d')
-            if hist.empty: return None, None, f"No price data found for {ticker_symbol}."
-            cmp = hist['Close'].iloc[-1]
+        # 2. Get Spot Price
+        if region == "India":
+            # For NSE scraper, sometimes .NS is added, strip it
+            clean_ticker = ticker.replace(".NS", "")
+            current_price = adapter.get_spot_price(clean_ticker)
+        else:
+            stock = yf.Ticker(ticker)
+            try:
+                current_price = stock.fast_info['last_price']
+            except:
+                hist = stock.history(period='1d')
+                if not hist.empty: current_price = hist['Close'].iloc[-1]
+                else: current_price = None
 
-        # Use updated helper to get next few months roughly
-        target_dates = get_expirations_within_days(stock, days_limit=90)[:3] 
-        if not target_dates: return None, None, f"No options data found for {ticker_symbol}."
+        if not current_price: return None, None, f"Could not fetch spot price for {ticker}"
+
+        # 3. Get Expirations
+        valid_dates = []
+        raw_data = None # For NSE scraper
+        valid_instruments = None # For Zerodha
+        
+        if region == "India":
+            if source == "Zerodha (API)":
+                valid_dates, valid_instruments = adapter.get_chain_for_symbol(clean_ticker)
+            else:
+                valid_dates, raw_data = adapter.get_expirations(clean_ticker, days_limit=90)
+                if valid_dates: valid_dates = valid_dates[:3]
+        else:
+            stock = yf.Ticker(ticker)
+            try:
+                exps = stock.options
+                today = datetime.date.today()
+                limit = today + datetime.timedelta(days=90)
+                for d in exps:
+                    dt = datetime.datetime.strptime(d, '%Y-%m-%d').date()
+                    if today <= dt <= limit: valid_dates.append(d)
+                valid_dates = valid_dates[:3]
+            except: pass
+
+        if not valid_dates: return None, None, "No valid expirations found."
 
         analysis_rows = []
-        summary_returns = {"Stock": ticker_symbol}
+        summary_returns = {"Stock": ticker}
 
-        for i, date in enumerate(target_dates):
-            time.sleep(random.uniform(1.0, 2.0)) # Rate limit protection
+        for date_obj in valid_dates:
+            # 4. Get Option Chain
+            calls, puts = pd.DataFrame(), pd.DataFrame()
+            
+            # Date Handling (Zerodha returns date objects, others strings)
+            if isinstance(date_obj, datetime.date): date_str = date_obj.strftime('%Y-%m-%d')
+            else: date_str = date_obj
+            
+            if region == "India":
+                if source == "Zerodha (API)":
+                    calls, puts = adapter.parse_chain(valid_instruments, date_obj) # Pass date object
+                else:
+                    calls, puts = adapter.parse_chain(raw_data, date_str)
+            else:
+                try:
+                    chain = stock.option_chain(date_str)
+                    calls, puts = chain.calls, chain.puts
+                except: continue
+
+            calls = filter_tradeable_options(calls)
+            puts = filter_tradeable_options(puts)
+            
+            if calls.empty or puts.empty: continue
+
+            # 5. Run Simple Strategy Logic
             try:
-                opt_chain = get_option_chain_with_retry(stock, date)
-                calls = opt_chain.calls
-                puts = opt_chain.puts
-                
-                if calls.empty and puts.empty: continue
-
                 if strategy_type == "Bull Call Spread":
-                    if calls.empty: continue
-                    valid_calls = filter_tradeable_options(calls)
-                    if valid_calls.empty: continue
-                    
-                    target_price = cmp * 1.05
-                    long_leg = find_closest_strike(valid_calls, cmp)
-                    short_leg = find_closest_strike(valid_calls, target_price)
+                    target_price = current_price * 1.05
+                    long_leg = find_closest_strike(calls, current_price)
+                    short_leg = find_closest_strike(calls, target_price)
 
                     if long_leg is None or short_leg is None: continue
                     if long_leg['strike'] == short_leg['strike']:
-                        higher_strikes = valid_calls[valid_calls['strike'] > long_leg['strike']]
-                        if not higher_strikes.empty: short_leg = higher_strikes.iloc[0]
+                        higher = calls[calls['strike'] > long_leg['strike']]
+                        if not higher.empty: short_leg = higher.iloc[0]
                         else: continue 
 
                     buy_strike = long_leg['strike']
@@ -191,68 +438,59 @@ def fetch_and_analyze_ticker(ticker_symbol, strategy_type):
                     if net_cost > 0: ret_pct = (max_gain / net_cost) * 100
 
                     analysis_rows.append({
-                        "Expiration": date, "Buy Strike": buy_strike, "Sell Strike": sell_strike,
+                        "Expiration": date_str, "Buy Strike": buy_strike, "Sell Strike": sell_strike,
                         "Net Cost": net_cost, "Max Gain": max_gain, "Return %": ret_pct, "Breakeven": breakeven
                     })
-                    summary_returns[date] = f"{ret_pct:.1f}%"
+                    summary_returns[date_str] = f"{ret_pct:.1f}%"
 
                 elif strategy_type == "Long Straddle":
-                    if calls.empty or puts.empty: continue
-                    valid_calls = filter_tradeable_options(calls)
-                    valid_puts = filter_tradeable_options(puts)
-                    if valid_calls.empty or valid_puts.empty: continue
-
-                    common_strikes = set(valid_calls['strike']).intersection(set(valid_puts['strike']))
-                    if not common_strikes: continue
-                    available_strikes = pd.DataFrame({'strike': list(common_strikes)})
-                    closest_row = find_closest_strike(available_strikes, cmp)
-                    if closest_row is None: continue
+                    common = set(calls['strike']).intersection(set(puts['strike']))
+                    if not common: continue
+                    avail = pd.DataFrame({'strike': list(common)})
+                    closest = find_closest_strike(avail, current_price)
+                    if closest is None: continue
                     
-                    strike = closest_row['strike']
-                    atm_call = valid_calls[valid_calls['strike'] == strike].iloc[0]
-                    atm_put = valid_puts[valid_puts['strike'] == strike].iloc[0]
-                    call_ask = get_price(atm_call, 'ask')
-                    put_ask = get_price(atm_put, 'ask')
+                    strike = closest['strike']
+                    c = calls[calls['strike'] == strike].iloc[0]
+                    p = puts[puts['strike'] == strike].iloc[0]
+                    c_ask = get_price(c, 'ask')
+                    p_ask = get_price(p, 'ask')
 
-                    if call_ask == 0 or put_ask == 0: continue
-                    net_cost = call_ask + put_ask
-                    breakeven_low = strike - net_cost
-                    breakeven_high = strike + net_cost
-                    move_pct = (net_cost / cmp) * 100
+                    if c_ask == 0 or p_ask == 0: continue
+                    net_cost = c_ask + p_ask
+                    be_low = strike - net_cost
+                    be_high = strike + net_cost
+                    move_pct = (net_cost / current_price) * 100
 
                     analysis_rows.append({
-                        "Expiration": date, "Strike": strike, "Call Cost": call_ask, "Put Cost": put_ask,
-                        "Net Cost": net_cost, "BE Low": breakeven_low, "BE High": breakeven_high, "Move Needed": move_pct
+                        "Expiration": date_str, "Strike": strike, "Call Cost": c_ask, "Put Cost": p_ask,
+                        "Net Cost": net_cost, "BE Low": be_low, "BE High": be_high, "Move Needed": move_pct
                     })
-                    summary_returns[date] = f"±{move_pct:.1f}%"
+                    summary_returns[date_str] = f"±{move_pct:.1f}%"
 
-            except Exception as e: continue
+            except: continue
 
-        if not analysis_rows: return None, None, "Could not construct valid spreads."
+        if not analysis_rows: return None, None, "Could not build strategies."
         return summary_returns, pd.DataFrame(analysis_rows), None
-    except Exception as e: return None, None, str(e)
 
+    except Exception as e:
+        return None, None, str(e)
 
 # ==========================================
-# PART 2: CUSTOM 4-LEG STRATEGY (REAL DATA)
-# WITH OPTIMIZATION ENGINE
+# CUSTOM 4-LEG STRATEGY (HYBRID)
 # ==========================================
 
 def calculate_strategy_metrics(legs, current_price, view):
-    """Calculates Net Premium, Max Profit, Max Loss, Margin/Capital, Brokerage, ROI."""
     net_premium = 0.0
     strikes = []
     
-    # Calculate Premium and collect strikes
     for leg in legs:
         strike = leg['row']['strike']
         strikes.append(strike)
-        # Ask if Buying, Bid if Selling
         price = get_price(leg['row'], 'ask' if leg['action'] == "Buy" else 'bid')
         impact = -price if leg['action'] == "Buy" else price
         net_premium += impact
 
-    # --- P&L Simulation ---
     sim_prices = sorted(strikes + [current_price])
     min_s, max_s = min(strikes), max(strikes)
     range_width = max_s - min_s
@@ -275,15 +513,7 @@ def calculate_strategy_metrics(legs, current_price, view):
     max_profit_gross = max(profits)
     max_loss = min(profits)
     
-    # --- Advanced Metrics ---
-    
-    # 1. Capital / Margin Calculation
-    # Neutral (Credit Strategy): Margin = Max Spread Width (Approx for IC)
-    # Volatile (Debit Strategy): Capital = Net Debit Paid
-    
     capital_required = 0.0
-    
-    # Identify spreads roughly
     puts = sorted([l for l in legs if l['type'] == 'Put'], key=lambda x: x['row']['strike'])
     calls = sorted([l for l in legs if l['type'] == 'Call'], key=lambda x: x['row']['strike'])
     
@@ -291,25 +521,13 @@ def calculate_strategy_metrics(legs, current_price, view):
         put_width = abs(puts[1]['row']['strike'] - puts[0]['row']['strike'])
         call_width = abs(calls[1]['row']['strike'] - calls[0]['row']['strike'])
         
-        if view == "Neutral": # Credit Strategy
-            # Margin is usually the wider of the two wings
+        if view == "Neutral":
             capital_required = max(put_width, call_width)
-        else: # Volatile (Debit Strategy)
-            # Capital is the debit paid
+        else:
             capital_required = abs(net_premium) if net_premium < 0 else 0.0
     
-    # 2. Brokerage Estimate
-    # Est ~$5.00 per leg total round trip per contract (standard retail non-discount)
-    # Here prices are per share. $5 per contract / 100 = $0.05 per share.
-    # 4 legs * $0.05 = $0.20 ?? No, usually brokerage is ~$0.65/contract.
-    # 4 legs open + 4 legs close = 8 actions.
-    # 8 * $0.65 = $5.20 total. Per share = $0.052.
     brokerage_per_share = 0.05
-    
-    # 3. Net Metrics
     net_max_profit = max_profit_gross - brokerage_per_share
-    
-    # 4. ROI
     roi = 0.0
     if capital_required > 0:
         roi = (net_max_profit / capital_required) * 100
@@ -325,37 +543,80 @@ def calculate_strategy_metrics(legs, current_price, view):
     }
 
 @st.cache_data(ttl=300, show_spinner=False)
-def analyze_custom_strategy(ticker, view, slab1_pct, slab2_pct, days_window, optimize=False):
-    """
-    Fetches expirations within 'days_window'.
-    Builds strategy based on Slab 1 (Near) and Slab 2 (Far).
-    view: 'Neutral' or 'Volatile'
-    """
+def analyze_custom_strategy(ticker, view, slab1_pct, slab2_pct, days_window, region="USA", source="Yahoo", z_api=None, z_token=None, optimize=False):
+    # Setup Adapter
+    adapter = None
+    if region == "India":
+        if source == "Zerodha (API)":
+            adapter = ZerodhaMarketAdapter(z_api, z_token)
+            if not adapter.connect(): return None, "Zerodha Connection Failed"
+        else:
+            adapter = NSEMarketAdapter()
+    
     try:
-        # 1. Fetch Data
-        stock = yf.Ticker(ticker)
-        try:
-            current_price = stock.fast_info['last_price']
-        except:
-            hist = stock.history(period='1d')
-            if hist.empty: return None, "No price data found."
-            current_price = hist['Close'].iloc[-1]
-            
-        earnings_date = get_next_earnings_date(stock)
-            
-        # Get Expirations based on Window
-        dates = get_expirations_within_days(stock, days_limit=days_window)
-        if not dates: return None, f"No option chain found within {days_window} days."
+        # 1. Spot Price
+        if region == "India":
+            clean_ticker = ticker.replace(".NS", "")
+            current_price = adapter.get_spot_price(clean_ticker)
+            # Earnings is messy from non-Yahoo sources, defaulting to Yahoo lookup even in India mode
+            # unless using NSE scraper specifically? Let's stick to Yahoo for ease.
+            try:
+                stock = yf.Ticker(f"{clean_ticker}.NS")
+                earnings_date = get_next_earnings_date(stock)
+            except: earnings_date = "N/A"
+        else:
+            stock = yf.Ticker(ticker)
+            try:
+                current_price = stock.fast_info['last_price']
+            except:
+                hist = stock.history(period='1d')
+                if not hist.empty: current_price = hist['Close'].iloc[-1]
+                else: current_price = None
+            earnings_date = get_next_earnings_date(stock)
+
+        if not current_price: return None, f"Could not fetch price for {ticker}"
+
+        # 2. Expirations
+        valid_dates = []
+        raw_data = None
+        valid_instruments = None
+        
+        if region == "India":
+            if source == "Zerodha (API)":
+                valid_dates, valid_instruments = adapter.get_chain_for_symbol(clean_ticker, days_limit=days_window)
+            else:
+                valid_dates, raw_data = adapter.get_expirations(clean_ticker, days_limit=days_window)
+        else:
+            stock = yf.Ticker(ticker)
+            dates = get_expirations_within_days(stock, days_limit=days_window)
+            valid_dates = dates
+            raw_data = None
+
+        if not valid_dates: return None, f"No expirations found."
         
         results_list = []
         errors = []
 
-        # LOOP THROUGH EACH EXPIRATION
-        for target_date in dates:
+        # 3. Process Each Expiry
+        for date_obj in valid_dates:
             try:
-                chain = get_option_chain_with_retry(stock, target_date)
-                calls = filter_tradeable_options(chain.calls).sort_values('strike').reset_index(drop=True)
-                puts = filter_tradeable_options(chain.puts).sort_values('strike').reset_index(drop=True)
+                calls, puts = pd.DataFrame(), pd.DataFrame()
+                
+                # Handle date types
+                if isinstance(date_obj, datetime.date): date_str = date_obj.strftime('%Y-%m-%d')
+                else: date_str = date_obj
+                
+                if region == "India":
+                    if source == "Zerodha (API)":
+                        calls, puts = adapter.parse_chain(valid_instruments, date_obj)
+                    else:
+                        calls, puts = adapter.parse_chain(raw_data, date_str)
+                else:
+                    chain = get_option_chain_with_retry(stock, date_str)
+                    calls, puts = chain.calls, chain.puts
+
+                calls = filter_tradeable_options(calls).sort_values('strike').reset_index(drop=True)
+                puts = filter_tradeable_options(puts).sort_values('strike').reset_index(drop=True)
                 
                 if calls.empty or puts.empty: continue
 
@@ -370,7 +631,6 @@ def analyze_custom_strategy(ticker, view, slab1_pct, slab2_pct, days_window, opt
                     "cf": current_price * (1 + s2)
                 }
                 
-                # Helper to build legs
                 def build_legs(pf_row, pn_row, cn_row, cf_row):
                     l = []
                     if view == "Neutral":
@@ -389,14 +649,12 @@ def analyze_custom_strategy(ticker, view, slab1_pct, slab2_pct, days_window, opt
                         ]
                     return l
 
-                # Find Base Rows
                 pf_base = find_closest_strike(puts, targets["pf"])
                 pn_base = find_closest_strike(puts, targets["pn"])
                 cn_base = find_closest_strike(calls, targets["cn"])
                 cf_base = find_closest_strike(calls, targets["cf"])
                 
-                if any(x is None for x in [pf_base, pn_base, cn_base, cf_base]):
-                    continue 
+                if any(x is None for x in [pf_base, pn_base, cn_base, cf_base]): continue 
 
                 base_legs = build_legs(pf_base, pn_base, cn_base, cf_base)
                 base_metrics = calculate_strategy_metrics(base_legs, current_price, view)
@@ -404,7 +662,7 @@ def analyze_custom_strategy(ticker, view, slab1_pct, slab2_pct, days_window, opt
                 payload = {
                     "ticker": ticker,
                     "current_price": current_price,
-                    "expiry": target_date,
+                    "expiry": date_str,
                     "earnings": earnings_date,
                     "base": {
                         "metrics": base_metrics,
@@ -413,7 +671,6 @@ def analyze_custom_strategy(ticker, view, slab1_pct, slab2_pct, days_window, opt
                     "optimized": None 
                 }
 
-                # --- OPTIMIZATION LOOP ---
                 if optimize:
                     def get_idx(df, strike): 
                         indices = df.index[df['strike'] == strike].tolist()
@@ -459,18 +716,15 @@ def analyze_custom_strategy(ticker, view, slab1_pct, slab2_pct, days_window, opt
                                                 "legs": cand_legs,
                                                 "ratio": ratio
                                             }
-                        
                         payload["optimized"] = best_config
                 
                 results_list.append(payload)
 
             except Exception as e:
-                errors.append(f"Date {target_date}: {str(e)}")
+                errors.append(f"Date {date_str}: {str(e)}")
                 continue
 
-        if not results_list:
-             return None, "Could not build strategies for selected time window."
-
+        if not results_list: return None, "Could not build strategies."
         return results_list, None
 
     except Exception as e:
@@ -481,22 +735,15 @@ def analyze_custom_strategy(ticker, view, slab1_pct, slab2_pct, days_window, opt
 # ==========================================
 
 def display_strategy_details(data, label, current_price):
-    """Generates the detailed expander content for a single strategy result."""
-    
     st.markdown(f"**{label}**")
     m = data['metrics']
-    
     c1, c2, c3, c4 = st.columns(4)
     net = m['net_premium']
     lbl = "Net Credit" if net > 0 else "Net Debit"
-    
     c1.metric("Capital/Margin", f"${m['capital_required']:.2f}")
     c2.metric("Net Max Profit", f"${m['net_max_profit']:.2f}")
     c3.metric(f"ROI %", f"{m['roi']:.1f}%")
     c4.metric("Est. Brokerage", f"${m['brokerage']:.2f}")
-    
-    ratio = m['max_upside'] / abs(m['max_loss']) if abs(m['max_loss']) > 0 else 0
-    # st.markdown(f"**Reward/Risk Ratio:** `{ratio:.2f}`")
     
     legs_simple = []
     for l in data['legs']:
@@ -511,6 +758,24 @@ def display_strategy_details(data, label, current_price):
 def main():
     st.title("🛡️ Options Strategy Master")
     
+    # 1. Sidebar Region Config
+    region = st.sidebar.selectbox("Select Market Region", ["USA (Yahoo)", "India"])
+    region_key = "USA" if "USA" in region else "India"
+    
+    # India Source Config
+    source = "Yahoo"
+    z_api, z_token = None, None
+    
+    # Load Credentials
+    saved_api, saved_token = load_zerodha_tokens()
+    
+    if region_key == "India":
+        source = st.sidebar.radio("India Data Source", ["NSE Website (Free/Flaky)", "Zerodha (API)"])
+        if source == "Zerodha (API)":
+            st.sidebar.info("Requires Kite Connect subscription.")
+            z_api = st.sidebar.text_input("API Key", value=saved_api if saved_api else "", type="password")
+            z_token = st.sidebar.text_input("Access Token", value=saved_token if saved_token else "", type="password")
+    
     mode = st.sidebar.radio(
         "Select Analysis Mode:", 
         ["Simple Analysis (Standard)", "Custom Strategy Generator (Slab Based)"],
@@ -518,19 +783,17 @@ def main():
     )
     st.sidebar.markdown("---")
     
-    if "input_simple" not in st.session_state:
-        st.session_state["input_simple"] = "NKE, AAPL, AMD, TSLA"
-    if "input_custom" not in st.session_state:
-        st.session_state["input_custom"] = "TSLA, AAPL, AMD"
+    if "input_simple" not in st.session_state: st.session_state["input_simple"] = ""
+    if "input_custom" not in st.session_state: st.session_state["input_custom"] = ""
 
-    presets = get_ticker_presets()
+    presets = get_ticker_presets(region_key)
 
     # ==========================================
     # MODE A: SIMPLE ANALYSIS
     # ==========================================
     if mode == "Simple Analysis (Standard)":
-        st.subheader("📈 Multi-Stock Real-Time Analysis")
-        st.caption("Fetches live option chains from Yahoo Finance. Standard Spreads/Straddles.")
+        st.subheader(f"📈 {region_key} Market Real-Time Analysis")
+        st.caption("Fetches live option chains. Standard Spreads/Straddles.")
         
         strategy = st.radio("Strategy Type:", ("Bull Call Spread", "Long Straddle"), horizontal=True)
         
@@ -546,6 +809,8 @@ def main():
         if st.button("Analyze Real-Time Data"):
             if not ticker_input:
                 st.error("Please enter at least one ticker.")
+            elif region_key == "India" and source == "Zerodha (API)" and (not z_api or not z_token):
+                st.error("Please provide Zerodha API credentials in sidebar.")
             else:
                 tickers = [t.strip().upper() for t in ticker_input.split(',') if t.strip()]
                 all_summaries = []
@@ -553,9 +818,9 @@ def main():
                 errors = []
                 
                 progress_bar = st.progress(0)
-                with st.spinner(f"Fetching data from Yahoo Finance..."):
+                with st.spinner(f"Fetching data..."):
                     for i, ticker in enumerate(tickers):
-                        summary, df, error = fetch_and_analyze_ticker(ticker, strategy)
+                        summary, df, error = fetch_and_analyze_ticker_hybrid(ticker, strategy, region_key, source, z_api, z_token)
                         if error: errors.append(f"{ticker}: {error}")
                         else:
                             all_summaries.append(summary)
@@ -585,8 +850,7 @@ def main():
     # MODE B: CUSTOM SLAB STRATEGY
     # ==========================================
     else:
-        st.subheader("🤖 Custom Slab-Based Strategy Generator")
-        st.caption("Generates strategies for all expirations within the selected window based on your Strike Slabs.")
+        st.subheader(f"🤖 {region_key} Slab-Based Strategy Generator")
         
         c1, c2 = st.columns(2)
         
@@ -615,70 +879,66 @@ def main():
         else:
             stop = False
 
-        st.info(f"Generating strategies for **{view}** outlook. Strikes: **±{slab1}%** and **±{slab2}%**.")
-
         if st.button("Generate Strategies") and not stop:
             if not ticker_input:
                 st.error("Please enter at least one ticker.")
-                return
+            elif region_key == "India" and source == "Zerodha (API)" and (not z_api or not z_token):
+                st.error("Please provide Zerodha API credentials in sidebar.")
+            else:
+                tickers = [t.strip().upper() for t in ticker_input.split(',') if t.strip()]
+                all_results = {}
+                all_summaries = []
+                errors = []
 
-            tickers = [t.strip().upper() for t in ticker_input.split(',') if t.strip()]
-            all_results = {}
-            all_summaries = []
-            errors = []
-
-            progress_bar = st.progress(0)
-            
-            with st.spinner(f"Scanning expirations for {len(tickers)} tickers..."):
-                for i, ticker in enumerate(tickers):
-                    results_list, error = analyze_custom_strategy(ticker, view, slab1, slab2, days_window, optimize=True)
-                    
-                    if error:
-                        errors.append(f"{ticker}: {error}")
-                    else:
-                        all_results[ticker] = results_list
-                        
-                        for res in results_list:
-                            metrics = res['optimized']['metrics'] if res['optimized'] else res['base']['metrics']
-                            ratio = res['optimized']['ratio'] if res['optimized'] else (res['base']['metrics']['max_upside'] / abs(res['base']['metrics']['max_loss']))
-                            
-                            summary_data = {
-                                "Stock": ticker,
-                                "Next Earnings": res['earnings'],
-                                "Expiry": res['expiry'],
-                                "Spot": f"${res['current_price']:.2f}",
-                                "Capital (Margin)": f"${metrics['capital_required']:.2f}",
-                                "Net Max Profit": f"${metrics['net_max_profit']:.2f}",
-                                "ROI": f"{metrics['roi']:.1f}%",
-                                "Est. Brokerage": f"${metrics['brokerage']:.2f}"
-                            }
-                            all_summaries.append(summary_data)
-                    
-                    progress_bar.progress((i + 1) / len(tickers))
-
-            # --- OUTPUT ---
-            st.divider()
-            
-            if all_summaries:
-                st.header("1. Strategy Summary (Optimized)")
-                summary_df = pd.DataFrame(all_summaries)
-                st.dataframe(summary_df, hide_index=True, use_container_width=True)
-
-                st.header("2. Detailed Trade Analysis")
+                progress_bar = st.progress(0)
                 
-                for ticker, results_list in all_results.items():
-                    st.markdown(f"### {ticker}")
-                    for res in results_list:
-                        opt_data = res['optimized'] if res['optimized'] else res['base']
-                        ratio = opt_data['metrics']['max_upside'] / abs(opt_data['metrics']['max_loss'])
-                        roi = opt_data['metrics']['roi']
+                with st.spinner(f"Scanning expirations..."):
+                    for i, ticker in enumerate(tickers):
+                        results_list, error = analyze_custom_strategy(ticker, view, slab1, slab2, days_window, region_key, source, z_api, z_token, optimize=True)
                         
-                        with st.expander(f"📅 {res['expiry']} | ROI {roi:.1f}% | R/R {ratio:.2f}", expanded=False):
-                            display_strategy_details(opt_data, "Recommended Strategy", res['current_price'])
+                        if error:
+                            errors.append(f"{ticker}: {error}")
+                        else:
+                            all_results[ticker] = results_list
+                            for res in results_list:
+                                metrics = res['optimized']['metrics'] if res['optimized'] else res['base']['metrics']
+                                ratio = res['optimized']['ratio'] if res['optimized'] else (res['base']['metrics']['max_upside'] / abs(res['base']['metrics']['max_loss']))
+                                
+                                summary_data = {
+                                    "Stock": ticker,
+                                    "Next Earnings": res['earnings'],
+                                    "Expiry": res['expiry'],
+                                    "Spot": f"${res['current_price']:.2f}",
+                                    "Capital (Margin)": f"${metrics['capital_required']:.2f}",
+                                    "Net Max Profit": f"${metrics['net_max_profit']:.2f}",
+                                    "ROI": f"{metrics['roi']:.1f}%",
+                                    "Est. Brokerage": f"${metrics['brokerage']:.2f}"
+                                }
+                                all_summaries.append(summary_data)
+                        
+                        progress_bar.progress((i + 1) / len(tickers))
 
-            if errors:
-                with st.expander("Errors / Skipped Tickers"):
-                    for err in errors: st.write(f"- {err}")
+                # --- OUTPUT ---
+                st.divider()
+                if all_summaries:
+                    st.header("1. Strategy Summary (Optimized)")
+                    summary_df = pd.DataFrame(all_summaries)
+                    st.dataframe(summary_df, hide_index=True, use_container_width=True)
+
+                    st.header("2. Detailed Trade Analysis")
+                    for ticker, results_list in all_results.items():
+                        st.markdown(f"### {ticker}")
+                        for res in results_list:
+                            opt_data = res['optimized'] if res['optimized'] else res['base']
+                            ratio = opt_data['metrics']['max_upside'] / abs(opt_data['metrics']['max_loss'])
+                            roi = opt_data['metrics']['roi']
+                            
+                            with st.expander(f"📅 {res['expiry']} | ROI {roi:.1f}% | R/R {ratio:.2f}", expanded=False):
+                                display_strategy_details(opt_data, "Recommended Strategy", res['current_price'])
+
+                if errors:
+                    with st.expander("Errors / Skipped Tickers"):
+                        for err in errors: st.write(f"- {err}")
 
 if __name__ == "__main__":
     main()
