@@ -253,6 +253,59 @@ class ZerodhaMarketAdapter:
 # SHARED HELPER FUNCTIONS
 # ==========================================
 
+def get_monthly_expirations(ticker_obj, limit=3):
+    """
+    Filters the list of expiration dates to find the next 'limit' distinct months.
+    Used for Simple Analysis (USA) to match original logic.
+    """
+    try:
+        expirations = ticker_obj.options
+        if not expirations:
+            return []
+
+        # Convert strings to datetime objects
+        dates = [datetime.datetime.strptime(date, '%Y-%m-%d') for date in expirations]
+        
+        unique_months = []
+        seen_months = set()
+        
+        for date in dates:
+            month_key = (date.year, date.month)
+            if month_key not in seen_months:
+                unique_months.append(date.strftime('%Y-%m-%d'))
+                seen_months.add(month_key)
+            
+            if len(unique_months) >= limit:
+                break
+                
+        return unique_months
+    except:
+        return []
+
+def get_expirations_within_days(ticker_obj, days_limit=30):
+    """Returns all expiration dates within the next X days."""
+    try:
+        expirations = ticker_obj.options
+    except:
+        return []
+        
+    if not expirations:
+        return []
+        
+    valid_dates = []
+    today = datetime.date.today()
+    limit_date = today + datetime.timedelta(days=days_limit)
+    
+    for date_str in expirations:
+        try:
+            exp_date = datetime.datetime.strptime(date_str, '%Y-%m-%d').date()
+            if today <= exp_date <= limit_date:
+                valid_dates.append(date_str)
+        except:
+            continue
+            
+    return valid_dates
+
 def get_next_earnings_date(ticker_obj):
     """Fetches the next earnings date."""
     try:
@@ -372,13 +425,8 @@ def fetch_and_analyze_ticker_hybrid(ticker, strategy_type, region="USA", source=
         else:
             stock = yf.Ticker(ticker)
             try:
-                exps = stock.options
-                today = datetime.date.today()
-                limit = today + datetime.timedelta(days=90)
-                for d in exps:
-                    dt = datetime.datetime.strptime(d, '%Y-%m-%d').date()
-                    if today <= dt <= limit: valid_dates.append(d)
-                valid_dates = valid_dates[:3]
+                # REVERTED TO ORIGINAL MONTHLY LOGIC FOR USA SIMPLE ANALYSIS
+                valid_dates = get_monthly_expirations(stock, limit=3)
             except: pass
 
         if not valid_dates: return None, None, "No valid expirations found."
