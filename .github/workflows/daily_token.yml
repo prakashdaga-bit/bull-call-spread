@@ -15,19 +15,24 @@ jobs:
     
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.9'
 
-      - name: Install Chrome
-        uses: browser-actions/setup-chrome@v1
-
       - name: Install Dependencies
         run: |
           pip install selenium pyotp kiteconnect webdriver-manager
+
+      - name: Check File Existence
+        run: |
+          ls -R
+          if [ ! -f "zerodha_auto_token.py" ]; then
+            echo "Error: zerodha_auto_token.py not found!"
+            exit 1
+          fi
 
       - name: Run Token Generator
         env:
@@ -36,12 +41,17 @@ jobs:
           ZERODHA_USER_ID: ${{ secrets.ZERODHA_USER_ID }}
           ZERODHA_PASSWORD: ${{ secrets.ZERODHA_PASSWORD }}
           ZERODHA_TOTP_SECRET: ${{ secrets.ZERODHA_TOTP_SECRET }}
-        run: python zerodha_auto_token.py
+        run: python -u zerodha_auto_token.py
 
       - name: Commit and Push Token
         run: |
           git config --global user.name "GitHub Action"
           git config --global user.email "action@github.com"
           git add zerodha_token.txt
-          git commit -m "Auto-update Zerodha Token [skip ci]" || echo "No changes to commit"
-          git push
+          # Only commit if there are changes
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Auto-update Zerodha Token [skip ci]"
+            git push
+          fi
