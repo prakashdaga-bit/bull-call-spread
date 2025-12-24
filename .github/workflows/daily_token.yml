@@ -1,0 +1,47 @@
+name: Daily Zerodha Token
+
+on:
+  schedule:
+    # Runs at 02:45 UTC (8:15 AM IST) every day
+    - cron: '45 2 * * *'
+  workflow_dispatch: # Allows manual triggering for testing
+
+permissions:
+  contents: write
+
+jobs:
+  update-token:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install Chrome
+        uses: browser-actions/setup-chrome@v1
+
+      - name: Install Dependencies
+        run: |
+          pip install selenium pyotp kiteconnect webdriver-manager
+
+      - name: Run Token Generator
+        env:
+          ZERODHA_API_KEY: ${{ secrets.ZERODHA_API_KEY }}
+          ZERODHA_API_SECRET: ${{ secrets.ZERODHA_API_SECRET }}
+          ZERODHA_USER_ID: ${{ secrets.ZERODHA_USER_ID }}
+          ZERODHA_PASSWORD: ${{ secrets.ZERODHA_PASSWORD }}
+          ZERODHA_TOTP_SECRET: ${{ secrets.ZERODHA_TOTP_SECRET }}
+        run: python zerodha_auto_token.py
+
+      - name: Commit and Push Token
+        run: |
+          git config --global user.name "GitHub Action"
+          git config --global user.email "action@github.com"
+          git add zerodha_token.txt
+          git commit -m "Auto-update Zerodha Token [skip ci]" || echo "No changes to commit"
+          git push
