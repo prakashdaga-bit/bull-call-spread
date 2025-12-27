@@ -206,6 +206,64 @@ class ZerodhaMarketAdapter:
             st.error(f"Quote Fetch Error: {e}")
             return {}
 
+    def get_lot_size(self, ticker):
+        if self.instruments is None:
+            self.instruments = self.get_instruments()
+        # Find first matching record
+        name = ticker
+        if ticker == "NIFTY": name = "NIFTY"
+        elif ticker == "BANKNIFTY": name = "BANKNIFTY"
+        
+        subset = self.instruments[self.instruments['name'] == name]
+        if not subset.empty:
+            return int(subset.iloc[0]['lot_size'])
+        return 1
+
+    def get_margin_for_basket(self, legs, lot_size=1):
+        """
+        Uses Kite Connect Order Margin API to get SPAN + Exposure margin.
+        legs: list of dicts with keys: 'row' (contains tradingsymbol), 'action' ('Buy'/'Sell'), 'type' ('Call'/'Put')
+        """
+        if not self.kite: return 0.0
+        
+        orders = []
+        for leg in legs:
+            # Need tradingsymbol from cached instruments
+            token = leg['row'].get('instrument_token') # We stored this in parse_chain for Zerodha
+            
+            # Find tradingsymbol from instruments df
+            if self.instruments is not None and token:
+                row = self.instruments[self.instruments['instrument_token'] == token]
+                if not row.empty:
+                    ts = row.iloc[0]['tradingsymbol']
+                    txn_type = self.kite.TRANSACTION_TYPE_BUY if leg['action'] == "Buy" else self.kite.TRANSACTION_TYPE_SELL
+                    
+                    orders.append({
+                        "exchange": "NFO",
+                        "tradingsymbol": ts,
+                        "transaction_type": txn_type,
+                        "variety": "regular",
+                        "product": "NRML",
+                        "order_type": "MARKET",
+                        "quantity": lot_size
+                    })
+        
+        if not orders: return 0.0
+        
+        try:
+            # basket_margin returns detailed breakdown
+            response = self.kite.basket_order_margins(orders)
+            # We want 'total' margin required for the final portfolio
+            # basket_order_margins returns details about initial and final margin
+            # We typically look at 'final' keys or initial depending on what user needs to place.
+            # Usually 'initial' margin is what blocks funds.
+            if response and 'initial' in response:
+                return response['initial'].get('total', 0.0)
+            return 0.0
+        except Exception as e:
+            # st.error(f"Margin Calc Error: {e}")
+            return 0.0
+
     def parse_chain(self, valid_instruments, expiry_date):
         # Filter for specific expiry
         expiry_subset = valid_instruments[valid_instruments['expiry'] == expiry_date]
@@ -216,7 +274,6 @@ class ZerodhaMarketAdapter:
         tokens = expiry_subset['instrument_token'].tolist()
         
         # Fetch Quotes
-        # Ideally batch this if huge
         quotes = self.fetch_quotes(tokens)
         
         calls_list = []
@@ -238,7 +295,8 @@ class ZerodhaMarketAdapter:
                 'lastPrice': q.get('last_price', 0),
                 'bid': buy.get('price', 0),
                 'ask': sell.get('price', 0),
-                'openInterest': q.get('oi', 0)
+                'openInterest': q.get('oi', 0),
+                'instrument_token': token # Store for margin calc
             }
             
             if row['instrument_type'] == 'CE':
@@ -381,7 +439,7 @@ def get_option_chain_with_retry(stock, date, retries=3):
 # ==========================================
 
 @st.cache_data(ttl=600, show_spinner=False)
-def fetch_and_analyze_ticker_hybrid(ticker, strategy_type, region="USA", source="Yahoo", z_api=None, z_token=None, target_pct=5.0):
+def fetch_and_analyze_ticker_hybrid_v2(ticker, strategy_type, region="USA", source="Yahoo", z_api=None, z_token=None, target_pct=5.0):
     """Handles logic for USA (Yahoo) and India (NSE Scraper OR Zerodha)."""
     
     # 1. Setup Adapter
@@ -484,9 +542,10 @@ def fetch_and_analyze_ticker_hybrid(ticker, strategy_type, region="USA", source=
                     ret_pct = 0
                     if net_cost > 0: ret_pct = (max_gain / net_cost) * 100
 
+                    # Storing raw numbers (floats) to avoid formatting errors in main
                     analysis_rows.append({
                         "Expiration": date_str, 
-                        "Spot Price": current_price,
+                        "Spot Price": float(current_price),
                         "Buy Strike": buy_strike, 
                         "Buy Premium": long_ask,
                         "Sell Strike": sell_strike, 
@@ -518,9 +577,10 @@ def fetch_and_analyze_ticker_hybrid(ticker, strategy_type, region="USA", source=
                     be_high = strike + net_cost
                     move_pct = (net_cost / current_price) * 100
 
+                    # Storing raw numbers (floats) to avoid formatting errors in main
                     analysis_rows.append({
                         "Expiration": date_str, 
-                        "Spot Price": current_price,
+                        "Spot Price": float(current_price),
                         "Strike": strike, 
                         "Call Cost": c_ask, 
                         "Put Cost": p_ask,
@@ -886,7 +946,8 @@ def main():
                 progress_bar = st.progress(0)
                 with st.spinner(f"Fetching data..."):
                     for i, ticker in enumerate(tickers):
-                        summary, df, error = fetch_and_analyze_ticker_hybrid(ticker, strategy, region_key, source, z_api, z_token, target_pct)
+                        # Renamed function call to bust cache and force fresh data fetch
+                        summary, df, error = fetch_and_analyze_ticker_hybrid_v2(ticker, strategy, region_key, source, z_api, z_token, target_pct)
                         if error: errors.append(f"{ticker}: {error}")
                         else:
                             all_summaries.append(summary)
