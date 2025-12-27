@@ -486,13 +486,13 @@ def fetch_and_analyze_ticker_hybrid(ticker, strategy_type, region="USA", source=
 
                     analysis_rows.append({
                         "Expiration": date_str, 
-                        "Spot Price": f"{current_price:.2f}",
+                        "Spot Price": current_price,
                         "Buy Strike": buy_strike, 
                         "Buy Premium": long_ask,
                         "Sell Strike": sell_strike, 
                         "Sell Premium": short_bid, 
                         "Net Cost": net_cost,
-                        "Cost/CMP %": f"{(net_cost/current_price)*100:.2f}%", 
+                        "Cost/CMP %": (net_cost/current_price)*100, 
                         "Max Gain": max_gain, 
                         "Return %": ret_pct, 
                         "Breakeven": breakeven
@@ -520,12 +520,12 @@ def fetch_and_analyze_ticker_hybrid(ticker, strategy_type, region="USA", source=
 
                     analysis_rows.append({
                         "Expiration": date_str, 
-                        "Spot Price": f"{current_price:.2f}",
+                        "Spot Price": current_price,
                         "Strike": strike, 
                         "Call Cost": c_ask, 
                         "Put Cost": p_ask,
                         "Net Cost": net_cost, 
-                        "Cost/CMP %": f"{(net_cost/current_price)*100:.2f}%",
+                        "Cost/CMP %": (net_cost/current_price)*100,
                         "BE Low": be_low, 
                         "BE High": be_high, 
                         "Move Needed": move_pct
