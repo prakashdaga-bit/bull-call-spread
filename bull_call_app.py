@@ -217,7 +217,7 @@ class ZerodhaMarketAdapter:
         valid_subset = subset[(subset['expiry'] >= today) & (subset['expiry'] <= limit)]
         unique_dates = sorted(valid_subset['expiry'].unique())
         
-        # Limit to 3 (Can be filtered further by index later)
+        # Limit to 3
         unique_dates = unique_dates[:3]
         
         return unique_dates, valid_subset
@@ -466,7 +466,7 @@ def get_option_chain_with_retry(stock, date, retries=3):
 # ==========================================
 
 @st.cache_data(ttl=600, show_spinner=False)
-def fetch_and_analyze_ticker_hybrid_v2(ticker, strategy_type, region="USA", source="Yahoo", z_api=None, z_token=None, start_pct=0.0, target_pct=5.0, expiry_idx=0):
+def fetch_and_analyze_ticker_hybrid_v2(ticker, strategy_type, region="USA", source="Yahoo", z_api=None, z_token=None, target_pct=5.0, start_pct=0.0, expiry_idx=0):
     """Handles logic for USA (Yahoo) and India (NSE Scraper OR Zerodha)."""
     
     # 1. Setup Adapter
@@ -565,6 +565,10 @@ def fetch_and_analyze_ticker_hybrid_v2(ticker, strategy_type, region="USA", sour
                         higher = calls[calls['strike'] > long_leg['strike']]
                         if not higher.empty: short_leg = higher.iloc[0]
                         else: continue 
+                    
+                    # Ensure Bull Call Spread Structure (Buy Low, Sell High)
+                    if long_leg['strike'] > short_leg['strike']:
+                        long_leg, short_leg = short_leg, long_leg
 
                     buy_strike = long_leg['strike']
                     sell_strike = short_leg['strike']
@@ -574,7 +578,7 @@ def fetch_and_analyze_ticker_hybrid_v2(ticker, strategy_type, region="USA", sour
                     if long_ask == 0: continue
                     net_cost = long_ask - short_bid
                     
-                    # Absolute Max Gain (Spread Width)
+                    # Absolute Max Gain (Spread Width) - NO Cost Deduction here based on request
                     max_gain_gross = sell_strike - buy_strike
                     
                     # Net Profit for ROI calc
@@ -974,8 +978,9 @@ def main():
         # ADDED Expiry Selection logic here
         expiry_idx = 0
         if region_key == "India":
+            c_exp, _ = st.columns([1,3])
             exp_opts = ["Current Month", "Next Month", "Far Month"]
-            exp_sel = st.selectbox("Select Expiry (India Only)", exp_opts)
+            exp_sel = c_exp.selectbox("Select Expiry (India Only)", exp_opts)
             expiry_idx = exp_opts.index(exp_sel)
         
         if strategy == "Bull Call Spread":
