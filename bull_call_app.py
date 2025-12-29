@@ -1010,6 +1010,9 @@ def main():
             else:
                 tickers = [t.strip().upper() for t in ticker_input.split(',') if t.strip()]
                 all_summaries, all_details, errors = [], {}, []
+                # NEW LIST for consolidated summary
+                consolidated_data = [] 
+                
                 progress_bar = st.progress(0)
                 with st.spinner(f"Fetching data..."):
                     for i, ticker in enumerate(tickers):
@@ -1019,14 +1022,65 @@ def main():
                         else:
                             all_summaries.append(summary)
                             all_details[ticker] = df
+                            
+                            # Prepare DF for consolidated view
+                            if not df.empty:
+                                df_summary = df.copy()
+                                df_summary.insert(0, "Stock", ticker)
+                                consolidated_data.append(df_summary)
+
                         progress_bar.progress((i + 1) / len(tickers))
+                
                 st.divider()
-                if all_summaries:
-                    st.header("Summary")
-                    summary_df = pd.DataFrame(all_summaries)
-                    st.dataframe(summary_df, hide_index=True, use_container_width=True)
+                
+                # NEW SUMMARY SECTION
+                if consolidated_data:
+                    st.header("1. Strategy Summary")
+                    
+                    # Merge all results
+                    full_df = pd.concat(consolidated_data, ignore_index=True)
+                    
+                    # Group by Expiration
+                    unique_expirations = sorted(full_df['Expiration'].unique())
+                    
+                    for exp in unique_expirations:
+                        st.subheader(f"Expiry: {exp}")
+                        
+                        # Filter for this expiry
+                        subset = full_df[full_df['Expiration'] == exp].drop(columns=['Expiration'])
+                        
+                        # Define Formatting
+                        if strategy == "Bull Call Spread":
+                            format_dict = {
+                                "Spot Price": "${:,.2f}",
+                                "Buy Premium": "${:,.2f}",
+                                "Sell Premium": "${:,.2f}",
+                                "Net Cost": "${:,.2f}",
+                                "Cost/CMP %": "{:.2f}%",
+                                "Max Gain": "${:,.2f}",
+                                "Breakeven": "${:,.2f}",
+                                "Return %": "{:.1f}%"
+                            }
+                        else:
+                            format_dict = {
+                                "Spot Price": "${:,.2f}",
+                                "Call Cost": "${:,.2f}",
+                                "Put Cost": "${:,.2f}",
+                                "Net Cost": "${:,.2f}",
+                                "Cost/CMP %": "{:.2f}%",
+                                "BE Low": "${:,.2f}",
+                                "BE High": "${:,.2f}",
+                                "Move Needed": "{:.1f}%"
+                            }
+                            
+                        # Apply formatting and display
+                        st.dataframe(subset.style.format(format_dict), hide_index=True, use_container_width=True)
+                
+                elif not errors:
+                     st.warning("No valid data found.")
+
                 if all_details:
-                    st.header("Detailed Breakdown")
+                    st.header("2. Detailed Breakdown")
                     for ticker, df in all_details.items():
                         with st.expander(f"{ticker} Details", expanded=False):
                             if strategy == "Bull Call Spread":
