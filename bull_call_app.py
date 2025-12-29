@@ -217,7 +217,7 @@ class ZerodhaMarketAdapter:
         valid_subset = subset[(subset['expiry'] >= today) & (subset['expiry'] <= limit)]
         unique_dates = sorted(valid_subset['expiry'].unique())
         
-        # Limit to 3
+        # Limit to 3 (Can be filtered further by index later)
         unique_dates = unique_dates[:3]
         
         return unique_dates, valid_subset
@@ -466,7 +466,7 @@ def get_option_chain_with_retry(stock, date, retries=3):
 # ==========================================
 
 @st.cache_data(ttl=600, show_spinner=False)
-def fetch_and_analyze_ticker_hybrid_v2(ticker, strategy_type, region="USA", source="Yahoo", z_api=None, z_token=None, start_pct=0.0, target_pct=5.0):
+def fetch_and_analyze_ticker_hybrid_v2(ticker, strategy_type, region="USA", source="Yahoo", z_api=None, z_token=None, start_pct=0.0, target_pct=5.0, expiry_idx=0):
     """Handles logic for USA (Yahoo) and India (NSE Scraper OR Zerodha)."""
     
     # 1. Setup Adapter
@@ -505,7 +505,7 @@ def fetch_and_analyze_ticker_hybrid_v2(ticker, strategy_type, region="USA", sour
                 valid_dates, valid_instruments = adapter.get_chain_for_symbol(clean_ticker)
             else:
                 valid_dates, raw_data = adapter.get_expirations(clean_ticker, days_limit=90)
-                if valid_dates: valid_dates = valid_dates[:3]
+                if valid_dates: valid_dates = valid_dates[:3] # Default max 3
         else:
             stock = yf.Ticker(ticker)
             try:
@@ -514,6 +514,13 @@ def fetch_and_analyze_ticker_hybrid_v2(ticker, strategy_type, region="USA", sour
             except: pass
 
         if not valid_dates: return None, None, "No valid expirations found."
+        
+        # --- EXPIRY FILTERING FOR INDIA ---
+        if region == "India" and valid_dates:
+            if expiry_idx < len(valid_dates):
+                valid_dates = [valid_dates[expiry_idx]]
+            else:
+                valid_dates = [valid_dates[-1]] # Fallback to furthest if index out of bounds
 
         analysis_rows = []
         summary_returns = {"Stock": ticker}
@@ -963,6 +970,14 @@ def main():
         
         start_pct = 0.0
         target_pct = 5.0
+        
+        # ADDED Expiry Selection logic here
+        expiry_idx = 0
+        if region_key == "India":
+            exp_opts = ["Current Month", "Next Month", "Far Month"]
+            exp_sel = st.selectbox("Select Expiry (India Only)", exp_opts)
+            expiry_idx = exp_opts.index(exp_sel)
+        
         if strategy == "Bull Call Spread":
             c1, c2 = st.columns(2)
             start_pct = c1.number_input("Buy Strike (% from Spot)", min_value=-50.0, max_value=50.0, value=0.0, step=0.5, help="Determines the Long Call Strike.")
@@ -987,7 +1002,7 @@ def main():
                 with st.spinner(f"Fetching data..."):
                     for i, ticker in enumerate(tickers):
                         # Renamed function call to bust cache and force fresh data fetch
-                        summary, df, error = fetch_and_analyze_ticker_hybrid_v2(ticker, strategy, region_key, source, z_api, z_token, target_pct, start_pct)
+                        summary, df, error = fetch_and_analyze_ticker_hybrid_v2(ticker, strategy, region_key, source, z_api, z_token, target_pct, start_pct, expiry_idx)
                         if error: errors.append(f"{ticker}: {error}")
                         else:
                             all_summaries.append(summary)
