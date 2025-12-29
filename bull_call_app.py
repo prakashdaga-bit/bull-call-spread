@@ -18,21 +18,48 @@ st.set_page_config(page_title="Options Strategy Master", page_icon="📈", layou
 # ==========================================
 # TICKER PRESETS
 # ==========================================
+@st.cache_data(ttl=86400) # Cache for 1 day
+def get_nse_fo_stocks():
+    """Fetches list of F&O stocks from NSE."""
+    try:
+        url = "https://nsearchives.nseindia.com/content/fo/fo_mktlots.csv"
+        # Mimic browser to avoid 403
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            from io import StringIO
+            df = pd.read_csv(StringIO(response.text))
+            df.columns = [c.strip().upper() for c in df.columns]
+            # Filter for rows that don't have 'SYMBOL' as value (header repetition) and ensure 'SYMBOL' column exists
+            if 'SYMBOL' in df.columns:
+                symbols = [x.strip() for x in df['SYMBOL'].astype(str).unique() if x.strip().upper() not in ["SYMBOL", "NAN"]]
+                return ", ".join(sorted(symbols))
+    except:
+        pass
+    # Fallback if fetch fails
+    return "RELIANCE, TCS, HDFCBANK, ICICIBANK, INFY, ITC, SBIN, BHARTIARTL, HINDUNILVR, LTIM, TATAMOTORS, M&M, MARUTI, BAJAJ-AUTO"
+
 def get_ticker_presets(region="USA"):
+    presets = {
+        "Custom / Manual Input": ""
+    }
+    
     if region == "USA":
-        return {
-            "Custom / Manual Input": "",
+        presets.update({
             "Magnificent 7": "NVDA, MSFT, AAPL, GOOGL, AMZN, META, TSLA",
             "ARK Innovation (Top 25)": "TSLA, COIN, ROKU, PLTR, SQ, RBLX, CRSP, PATH, SHOP, U, DKNG, TDOC, HOOD, ZM, TWLO, NTLA, EXAS, BEAM, PACB, VCYT, DNA, RXRX, PD, ADPT, TXG",
             "NASDAQ 100 (Top 25)": "AAPL, MSFT, NVDA, AMZN, GOOGL, META, AVGO, TSLA, GOOG, COST, AMD, NFLX, PEP, ADBE, LIN, CSCO, TMUS, QCOM, INTC, AMGN, INTU, TXN, CMCSA, AMAT, HON"
-        }
+        })
     else:
-        return {
-            "Custom / Manual Input": "",
+        # Fetch NSE list
+        fo_list = get_nse_fo_stocks()
+        presets.update({
             "NIFTY 50 Top 10": "RELIANCE, TCS, HDFCBANK, ICICIBANK, INFY, ITC, SBIN, BHARTIARTL, HINDUNILVR, LTIM",
             "Indices": "NIFTY, BANKNIFTY, FINNIFTY",
-            "Auto Sector": "TATAMOTORS, M&M, MARUTI, BAJAJ-AUTO, HEROMOTOCO, EICHERMOT"
-        }
+            "Auto Sector": "TATAMOTORS, M&M, MARUTI, BAJAJ-AUTO, HEROMOTOCO, EICHERMOT",
+            "All F&O Stocks": fo_list
+        })
+    return presets
 
 # ==========================================
 # HELPER: LOAD TOKENS FROM FILE
@@ -439,7 +466,7 @@ def get_option_chain_with_retry(stock, date, retries=3):
 # ==========================================
 
 @st.cache_data(ttl=600, show_spinner=False)
-def fetch_and_analyze_ticker_hybrid_v2(ticker, strategy_type, region="USA", source="Yahoo", z_api=None, z_token=None, target_pct=5.0):
+def fetch_and_analyze_ticker_hybrid_v2(ticker, strategy_type, region="USA", source="Yahoo", z_api=None, z_token=None, start_pct=0.0, target_pct=5.0):
     """Handles logic for USA (Yahoo) and India (NSE Scraper OR Zerodha)."""
     
     # 1. Setup Adapter
@@ -518,9 +545,13 @@ def fetch_and_analyze_ticker_hybrid_v2(ticker, strategy_type, region="USA", sour
             # 5. Run Simple Strategy Logic
             try:
                 if strategy_type == "Bull Call Spread":
-                    target_price = current_price * (1 + target_pct/100.0)
-                    long_leg = find_closest_strike(calls, current_price)
-                    short_leg = find_closest_strike(calls, target_price)
+                    # Start Price (Long Leg) based on start_pct
+                    buy_target_price = current_price * (1 + start_pct/100.0)
+                    # Sell Price (Short Leg) based on target_pct
+                    sell_target_price = current_price * (1 + target_pct/100.0)
+                    
+                    long_leg = find_closest_strike(calls, buy_target_price)
+                    short_leg = find_closest_strike(calls, sell_target_price)
 
                     if long_leg is None or short_leg is None: continue
                     if long_leg['strike'] == short_leg['strike']:
@@ -535,12 +566,17 @@ def fetch_and_analyze_ticker_hybrid_v2(ticker, strategy_type, region="USA", sour
 
                     if long_ask == 0: continue
                     net_cost = long_ask - short_bid
-                    spread_width = sell_strike - buy_strike
-                    max_gain = spread_width - net_cost
+                    
+                    # Absolute Max Gain (Spread Width)
+                    max_gain_gross = sell_strike - buy_strike
+                    
+                    # Net Profit for ROI calc
+                    net_profit = max_gain_gross - net_cost
+                    
                     breakeven = buy_strike + net_cost
                     
                     ret_pct = 0
-                    if net_cost > 0: ret_pct = (max_gain / net_cost) * 100
+                    if net_cost > 0: ret_pct = (net_profit / net_cost) * 100
 
                     # Storing raw numbers (floats) to avoid formatting errors in main
                     analysis_rows.append({
@@ -552,7 +588,7 @@ def fetch_and_analyze_ticker_hybrid_v2(ticker, strategy_type, region="USA", sour
                         "Sell Premium": short_bid, 
                         "Net Cost": net_cost,
                         "Cost/CMP %": (net_cost/current_price)*100, 
-                        "Max Gain": max_gain, 
+                        "Max Gain": max_gain_gross, 
                         "Return %": ret_pct, 
                         "Breakeven": breakeven
                     })
@@ -924,9 +960,13 @@ def main():
         st.subheader(f"📈 {region_key} Market Real-Time Analysis")
         st.caption("Fetches live option chains. Standard Spreads/Straddles.")
         strategy = st.radio("Strategy Type:", ("Bull Call Spread", "Long Straddle"), horizontal=True)
+        
+        start_pct = 0.0
         target_pct = 5.0
         if strategy == "Bull Call Spread":
-            target_pct = st.number_input("Target Upside (%)", min_value=1.0, max_value=100.0, value=5.0, step=0.5)
+            c1, c2 = st.columns(2)
+            start_pct = c1.number_input("Buy Strike (% from Spot)", min_value=-50.0, max_value=50.0, value=0.0, step=0.5, help="Determines the Long Call Strike.")
+            target_pct = c2.number_input("Sell Strike (% from Spot)", min_value=-50.0, max_value=50.0, value=5.0, step=0.5, help="Determines the Short Call Strike.")
         
         def on_preset_simple_change():
             sel = st.session_state.preset_simple
@@ -947,7 +987,7 @@ def main():
                 with st.spinner(f"Fetching data..."):
                     for i, ticker in enumerate(tickers):
                         # Renamed function call to bust cache and force fresh data fetch
-                        summary, df, error = fetch_and_analyze_ticker_hybrid_v2(ticker, strategy, region_key, source, z_api, z_token, target_pct)
+                        summary, df, error = fetch_and_analyze_ticker_hybrid_v2(ticker, strategy, region_key, source, z_api, z_token, target_pct, start_pct)
                         if error: errors.append(f"{ticker}: {error}")
                         else:
                             all_summaries.append(summary)
