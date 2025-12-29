@@ -466,7 +466,7 @@ def get_option_chain_with_retry(stock, date, retries=3):
 # ==========================================
 
 @st.cache_data(ttl=600, show_spinner=False)
-def fetch_and_analyze_ticker_hybrid_v2(ticker, strategy_type, region="USA", source="Yahoo", z_api=None, z_token=None, target_pct=5.0, start_pct=0.0, expiry_idx=0):
+def fetch_and_analyze_ticker_hybrid_v3(ticker, strategy_type, region="USA", source="Yahoo", z_api=None, z_token=None, target_pct=5.0, start_pct=0.0, expiry_idx=0):
     """Handles logic for USA (Yahoo) and India (NSE Scraper OR Zerodha)."""
     
     # 1. Setup Adapter
@@ -552,23 +552,30 @@ def fetch_and_analyze_ticker_hybrid_v2(ticker, strategy_type, region="USA", sour
             # 5. Run Simple Strategy Logic
             try:
                 if strategy_type == "Bull Call Spread":
-                    # Start Price (Long Leg) based on start_pct
-                    buy_target_price = current_price * (1 + start_pct/100.0)
-                    # Sell Price (Short Leg) based on target_pct
-                    sell_target_price = current_price * (1 + target_pct/100.0)
+                    # Determine target prices
+                    price_1 = current_price * (1 + start_pct/100.0)
+                    price_2 = current_price * (1 + target_pct/100.0)
                     
-                    long_leg = find_closest_strike(calls, buy_target_price)
-                    short_leg = find_closest_strike(calls, sell_target_price)
+                    # Find closest strikes
+                    leg_1 = find_closest_strike(calls, price_1)
+                    leg_2 = find_closest_strike(calls, price_2)
 
-                    if long_leg is None or short_leg is None: continue
-                    if long_leg['strike'] == short_leg['strike']:
-                        higher = calls[calls['strike'] > long_leg['strike']]
-                        if not higher.empty: short_leg = higher.iloc[0]
+                    if leg_1 is None or leg_2 is None: continue
+                    if leg_1['strike'] == leg_2['strike']:
+                        higher = calls[calls['strike'] > leg_1['strike']]
+                        if not higher.empty: leg_2 = higher.iloc[0]
                         else: continue 
+
+                    # Explicitly sort strikes for Bull Call Spread (Debit Spread)
+                    # Bull Call = Buy Lower Strike (ITM/ATM), Sell Higher Strike (OTM)
+                    # Regardless of which input was which
                     
-                    # Ensure Bull Call Spread Structure (Buy Low, Sell High)
-                    if long_leg['strike'] > short_leg['strike']:
-                        long_leg, short_leg = short_leg, long_leg
+                    if leg_1['strike'] < leg_2['strike']:
+                        long_leg = leg_1
+                        short_leg = leg_2
+                    else:
+                        long_leg = leg_2
+                        short_leg = leg_1
 
                     buy_strike = long_leg['strike']
                     sell_strike = short_leg['strike']
@@ -1007,7 +1014,7 @@ def main():
                 with st.spinner(f"Fetching data..."):
                     for i, ticker in enumerate(tickers):
                         # Renamed function call to bust cache and force fresh data fetch
-                        summary, df, error = fetch_and_analyze_ticker_hybrid_v2(ticker, strategy, region_key, source, z_api, z_token, target_pct, start_pct, expiry_idx)
+                        summary, df, error = fetch_and_analyze_ticker_hybrid_v3(ticker, strategy, region_key, source, z_api, z_token, target_pct, start_pct, expiry_idx)
                         if error: errors.append(f"{ticker}: {error}")
                         else:
                             all_summaries.append(summary)
