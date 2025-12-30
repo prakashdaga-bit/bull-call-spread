@@ -493,7 +493,7 @@ def get_option_chain_with_retry(stock, date, retries=3):
 # ==========================================
 
 @st.cache_data(ttl=600, show_spinner=False)
-def fetch_and_analyze_ticker_hybrid_v7(ticker, strategy_type, region="USA", source="Yahoo", z_api=None, z_token=None, pct_1=0.0, pct_2=5.0, expiry_idx=0):
+def fetch_and_analyze_ticker_hybrid_v8(ticker, strategy_type, region="USA", source="Yahoo", z_api=None, z_token=None, pct_1=0.0, pct_2=5.0, expiry_idx=0):
     """Handles logic for USA (Yahoo) and India (NSE Scraper OR Zerodha)."""
     
     # 1. Setup Adapter
@@ -716,7 +716,18 @@ def fetch_and_analyze_ticker_hybrid_v7(ticker, strategy_type, region="USA", sour
             except: continue
 
         if not analysis_rows: return None, None, "Could not build strategies."
-        return summary_returns, pd.DataFrame(analysis_rows), None
+        
+        # Convert to DataFrame
+        df = pd.DataFrame(analysis_rows)
+        
+        # Data Cleaning: Force Numeric Types
+        if not df.empty:
+            cols_to_numeric = ["Spot Price", "Buy Strike", "Buy Premium", "Sell Strike", "Sell Premium", "Net Cost", "Max Gain", "Breakeven", "Return %", "Cost/CMP %", "Strike", "Call Cost", "Put Cost", "BE Low", "BE High", "Move Needed"]
+            for col in cols_to_numeric:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
+
+        return summary_returns, df, None
 
     except Exception as e:
         return None, None, str(e)
@@ -1029,17 +1040,12 @@ def main():
                 with st.spinner(f"Fetching data..."):
                     for i, ticker in enumerate(tickers):
                         # Renamed function call to bust cache and force fresh data fetch
-                        summary, df, error = fetch_and_analyze_ticker_hybrid_v7(ticker, strategy, region_key, source, z_api, z_token, pct_2, pct_1, expiry_idx)
+                        summary, df, error = fetch_and_analyze_ticker_hybrid_v8(ticker, strategy, region_key, source, z_api, z_token, pct_2, pct_1, expiry_idx)
                         if error: errors.append(f"{ticker}: {error}")
                         else:
                             all_summaries.append(summary)
                             
                             # Clean numeric columns to avoid string formatting crash
-                            if not df.empty:
-                                for col in df.columns:
-                                    if col not in ['Expiration']:
-                                        df[col] = pd.to_numeric(df[col], errors='coerce')
-                            
                             all_details[ticker] = df
                             if not df.empty:
                                 df_summary = df.copy()
@@ -1067,13 +1073,22 @@ def main():
                                 "Net Cost": "${:,.2f}", "Cost/CMP %": "{:.2f}%", "BE Low": "${:,.2f}",
                                 "BE High": "${:,.2f}", "Move Needed": "{:.1f}%"
                             }
-                        st.dataframe(subset.style.format(format_dict), hide_index=True, use_container_width=True)
+                        # SAFETY WRAPPER FOR STYLING
+                        try:
+                            st.dataframe(subset.style.format(format_dict), hide_index=True, use_container_width=True)
+                        except Exception as e:
+                            st.error(f"⚠️ Formatting error for {exp}. Showing raw data.")
+                            st.dataframe(subset, hide_index=True, use_container_width=True)
+
                 elif not errors: st.warning("No valid data found.")
 
                 if all_details:
                     st.header("2. Detailed Breakdown")
                     for ticker, df in all_details.items():
                         with st.expander(f"{ticker} Details", expanded=False):
+                            with st.expander("Debug Info"):
+                                st.write(df.dtypes)
+                            
                             if strategy != "Long Straddle":
                                 format_dict = {
                                     "Spot Price": "${:,.2f}", "Buy Premium": "${:,.2f}", "Sell Premium": "${:,.2f}",
@@ -1086,7 +1101,11 @@ def main():
                                     "Net Cost": "${:,.2f}", "Cost/CMP %": "{:.2f}%", "BE Low": "${:,.2f}",
                                     "BE High": "${:,.2f}", "Move Needed": "{:.1f}%"
                                 }
-                            st.dataframe(df.style.format(format_dict), use_container_width=True)
+                            try:
+                                st.dataframe(df.style.format(format_dict), use_container_width=True)
+                            except Exception as e:
+                                st.error(f"⚠️ Formatting error. Showing raw data.")
+                                st.dataframe(df, use_container_width=True)
                 if errors:
                     with st.expander("Errors"):
                         for e in errors: st.write(f"- {e}")
