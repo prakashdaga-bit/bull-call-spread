@@ -71,10 +71,19 @@ def load_zerodha_tokens():
             with open("zerodha_token.txt", "r") as f:
                 content = f.read().strip()
                 if "," in content:
-                    return content.split(",", 1)
+                    parts = content.split(",", 1)
+                    return parts[0].strip(), parts[1].strip()
         except:
             pass
     return None, None
+
+def get_token_file_age():
+    """Returns the modification time of the token file."""
+    if os.path.exists("zerodha_token.txt"):
+        timestamp = os.path.getmtime("zerodha_token.txt")
+        modified_date = datetime.datetime.fromtimestamp(timestamp)
+        return modified_date
+    return None
 
 # ==========================================
 # MARKET ADAPTERS
@@ -158,8 +167,8 @@ class ZerodhaMarketAdapter:
     Requires 'kiteconnect' package: pip install kiteconnect
     """
     def __init__(self, api_key, access_token):
-        self.api_key = api_key
-        self.access_token = access_token
+        self.api_key = api_key.strip()
+        self.access_token = access_token.strip()
         self.kite = None
         self.instruments = None
         
@@ -227,7 +236,13 @@ class ZerodhaMarketAdapter:
         # Batches of 500? Check documentation. 
         # For simplicity, passing list directly.
         try:
-            quotes = self.kite.quote(instrument_tokens)
+            quotes = {}
+            chunk_size = 500
+            for i in range(0, len(instrument_tokens), chunk_size):
+                batch = instrument_tokens[i:i + chunk_size]
+                batch_quotes = self.kite.quote(batch)
+                quotes.update(batch_quotes)
+                time.sleep(0.1)
             return quotes
         except Exception as e:
             st.error(f"Quote Fetch Error: {e}")
@@ -961,6 +976,16 @@ def main():
             st.sidebar.info("Requires Kite Connect subscription.")
             z_api = st.sidebar.text_input("API Key", value=saved_api if saved_api else "", type="password")
             z_token = st.sidebar.text_input("Access Token", value=saved_token if saved_token else "", type="password")
+        
+        # Check token file age
+        file_time = None
+        if os.path.exists("zerodha_token.txt"):
+             file_time = datetime.datetime.fromtimestamp(os.path.getmtime("zerodha_token.txt"))
+             hours_old = (datetime.datetime.now() - file_time).total_seconds() / 3600
+             if hours_old > 12:
+                 st.sidebar.warning(f"⚠️ Token file is {hours_old:.1f} hours old. Auto-login might have failed.")
+             else:
+                 st.sidebar.success(f"✅ Token updated: {file_time.strftime('%H:%M')}")
     
     mode = st.sidebar.radio(
         "Select Analysis Mode:", 
