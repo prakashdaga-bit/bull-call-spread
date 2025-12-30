@@ -493,7 +493,7 @@ def get_option_chain_with_retry(stock, date, retries=3):
 # ==========================================
 
 @st.cache_data(ttl=600, show_spinner=False)
-def fetch_and_analyze_ticker_hybrid_v10(ticker, strategy_type, region="USA", source="Yahoo", z_api=None, z_token=None, pct_1=0.0, pct_2=5.0, expiry_idx=0):
+def fetch_and_analyze_ticker_hybrid_v11(ticker, strategy_type, region="USA", source="Yahoo", z_api=None, z_token=None, pct_1=0.0, pct_2=5.0, expiry_idx=0):
     """Handles logic for USA (Yahoo) and India (NSE Scraper OR Zerodha)."""
     
     # 1. Setup Adapter
@@ -1015,8 +1015,7 @@ def main():
             c_exp, _ = st.columns([1,3])
             exp_opts = ["Current Month", "Next Month", "Far Month"]
             exp_sel = c_exp.selectbox("Select Expiry (India Only)", exp_opts)
-            try: expiry_idx = exp_opts.index(exp_sel)
-            except: expiry_idx = 0
+            expiry_idx = exp_opts.index(exp_sel)
         
         if strategy != "Long Straddle":
             c1, c2 = st.columns(2)
@@ -1044,10 +1043,12 @@ def main():
                 with st.spinner(f"Fetching data..."):
                     for i, ticker in enumerate(tickers):
                         # Renamed function call to bust cache and force fresh data fetch
-                        summary, df, error = fetch_and_analyze_ticker_hybrid_v10(ticker, strategy, region_key, source, z_api, z_token, pct_2, pct_1, expiry_idx)
+                        summary, df, error = fetch_and_analyze_ticker_hybrid_v11(ticker, strategy, region_key, source, z_api, z_token, pct_2, pct_1, expiry_idx)
                         if error: errors.append(f"{ticker}: {error}")
                         else:
                             all_summaries.append(summary)
+                            
+                            # Clean numeric columns to avoid string formatting crash
                             all_details[ticker] = df
                             if not df.empty:
                                 df_summary = df.copy()
@@ -1075,10 +1076,11 @@ def main():
                                 "Net Cost": "${:,.2f}", "Cost/CMP %": "{:.2f}%", "BE Low": "${:,.2f}",
                                 "BE High": "${:,.2f}", "Move Needed": "{:.1f}%"
                             }
+                        
+                        # Use try/except block for display robustness
                         try:
                             st.dataframe(subset.style.format(format_dict), hide_index=True, use_container_width=True)
-                        except Exception as e:
-                            st.error(f"⚠️ Formatting error for {exp}. Showing raw data.")
+                        except:
                             st.dataframe(subset, hide_index=True, use_container_width=True)
 
                 elif not errors: st.warning("No valid data found.")
@@ -1087,8 +1089,6 @@ def main():
                     st.header("2. Detailed Breakdown")
                     for ticker, df in all_details.items():
                         with st.expander(f"{ticker} Details", expanded=False):
-                            with st.expander("Debug Info"):
-                                st.write(df.dtypes)
                             
                             if strategy != "Long Straddle":
                                 format_dict = {
