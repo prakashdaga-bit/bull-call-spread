@@ -62,15 +62,26 @@ def get_ticker_presets(region="USA"):
 # HELPER: LOAD TOKENS FROM FILE
 # ==========================================
 def load_zerodha_tokens():
+    """Reads api_key and access_token from local file if it exists."""
     if os.path.exists("zerodha_token.txt"):
         try:
             with open("zerodha_token.txt", "r") as f:
                 content = f.read().strip()
                 if "," in content:
-                    return content.split(",", 1)
+                    parts = content.split(",", 1)
+                    # Robustly strip whitespace/newlines
+                    return parts[0].strip(), parts[1].strip()
         except:
             pass
     return None, None
+
+def get_token_file_info():
+    """Returns formatted string of token age."""
+    if os.path.exists("zerodha_token.txt"):
+        timestamp = os.path.getmtime("zerodha_token.txt")
+        dt = datetime.datetime.fromtimestamp(timestamp)
+        return dt
+    return None
 
 # ==========================================
 # MARKET ADAPTERS
@@ -807,6 +818,15 @@ def main():
             st.sidebar.info("Requires Kite Connect subscription.")
             z_api = st.sidebar.text_input("API Key", value=saved_api if saved_api else "", type="password")
             z_token = st.sidebar.text_input("Access Token", value=saved_token if saved_token else "", type="password")
+        
+        # Check token file age
+        file_dt = get_token_file_info()
+        if file_dt:
+             hours_old = (datetime.datetime.now() - file_dt).total_seconds() / 3600
+             if hours_old > 12:
+                 st.sidebar.warning(f"⚠️ Token file is {hours_old:.1f} hours old. Auto-login might have failed.")
+             else:
+                 st.sidebar.success(f"✅ Token updated: {file_dt.strftime('%H:%M')}")
     
     mode = st.sidebar.radio(
         "Select Analysis Mode:", 
@@ -860,6 +880,7 @@ def main():
                 progress_bar = st.progress(0)
                 with st.spinner(f"Fetching data..."):
                     for i, ticker in enumerate(tickers):
+                        # Renamed function call to bust cache and force fresh data fetch
                         summary, df, error = fetch_and_analyze_ticker_hybrid_v4(ticker, strategy, region_key, source, z_api, z_token, pct_2, pct_1, expiry_idx)
                         if error: errors.append(f"{ticker}: {error}")
                         else:
