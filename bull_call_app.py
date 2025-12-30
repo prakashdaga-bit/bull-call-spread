@@ -478,7 +478,7 @@ def get_option_chain_with_retry(stock, date, retries=3):
 # ==========================================
 
 @st.cache_data(ttl=600, show_spinner=False)
-def fetch_and_analyze_ticker_hybrid_v5(ticker, strategy_type, region="USA", source="Yahoo", z_api=None, z_token=None, pct_1=0.0, pct_2=5.0, expiry_idx=0):
+def fetch_and_analyze_ticker_hybrid_v6(ticker, strategy_type, region="USA", source="Yahoo", z_api=None, z_token=None, pct_1=0.0, pct_2=5.0, expiry_idx=0):
     """Handles logic for USA (Yahoo) and India (NSE Scraper OR Zerodha)."""
     
     # 1. Setup Adapter
@@ -577,7 +577,8 @@ def fetch_and_analyze_ticker_hybrid_v5(ticker, strategy_type, region="USA", sour
                     # Buy Low Call, Sell High Call (Debit)
                     leg_a = find_closest_strike(calls, price_1)
                     leg_b = find_closest_strike(calls, price_2)
-                    if not leg_a or not leg_b or leg_a['strike'] == leg_b['strike']: continue
+                    
+                    if leg_a is None or leg_b is None or leg_a['strike'] == leg_b['strike']: continue
                     
                     buy_leg = leg_a if leg_a['strike'] < leg_b['strike'] else leg_b
                     sell_leg = leg_b if leg_a['strike'] < leg_b['strike'] else leg_a
@@ -596,7 +597,8 @@ def fetch_and_analyze_ticker_hybrid_v5(ticker, strategy_type, region="USA", sour
                     # Sell Low Call, Buy High Call (Credit)
                     leg_a = find_closest_strike(calls, price_1)
                     leg_b = find_closest_strike(calls, price_2)
-                    if not leg_a or not leg_b or leg_a['strike'] == leg_b['strike']: continue
+                    
+                    if leg_a is None or leg_b is None or leg_a['strike'] == leg_b['strike']: continue
                     
                     sell_leg = leg_a if leg_a['strike'] < leg_b['strike'] else leg_b
                     buy_leg = leg_b if leg_a['strike'] < leg_b['strike'] else leg_a
@@ -614,7 +616,8 @@ def fetch_and_analyze_ticker_hybrid_v5(ticker, strategy_type, region="USA", sour
                     # Buy Low Put, Sell High Put (Credit)
                     leg_a = find_closest_strike(puts, price_1)
                     leg_b = find_closest_strike(puts, price_2)
-                    if not leg_a or not leg_b or leg_a['strike'] == leg_b['strike']: continue
+                    
+                    if leg_a is None or leg_b is None or leg_a['strike'] == leg_b['strike']: continue
                     
                     buy_leg = leg_a if leg_a['strike'] < leg_b['strike'] else leg_b
                     sell_leg = leg_b if leg_a['strike'] < leg_b['strike'] else leg_a
@@ -632,7 +635,8 @@ def fetch_and_analyze_ticker_hybrid_v5(ticker, strategy_type, region="USA", sour
                     # Sell Low Put, Buy High Put (Debit)
                     leg_a = find_closest_strike(puts, price_1)
                     leg_b = find_closest_strike(puts, price_2)
-                    if not leg_a or not leg_b or leg_a['strike'] == leg_b['strike']: continue
+                    
+                    if leg_a is None or leg_b is None or leg_a['strike'] == leg_b['strike']: continue
                     
                     sell_leg = leg_a if leg_a['strike'] < leg_b['strike'] else leg_b
                     buy_leg = leg_b if leg_a['strike'] < leg_b['strike'] else leg_a
@@ -1001,7 +1005,7 @@ def main():
                 with st.spinner(f"Fetching data..."):
                     for i, ticker in enumerate(tickers):
                         # Renamed function call to bust cache and force fresh data fetch
-                        summary, df, error = fetch_and_analyze_ticker_hybrid_v5(ticker, strategy, region_key, source, z_api, z_token, pct_2, pct_1, expiry_idx)
+                        summary, df, error = fetch_and_analyze_ticker_hybrid_v6(ticker, strategy, region_key, source, z_api, z_token, pct_2, pct_1, expiry_idx)
                         if error: errors.append(f"{ticker}: {error}")
                         else:
                             all_summaries.append(summary)
