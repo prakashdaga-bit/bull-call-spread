@@ -493,7 +493,7 @@ def get_option_chain_with_retry(stock, date, retries=3):
 # ==========================================
 
 @st.cache_data(ttl=600, show_spinner=False)
-def fetch_and_analyze_ticker_hybrid_v9(ticker, strategy_type, region="USA", source="Yahoo", z_api=None, z_token=None, pct_1=0.0, pct_2=5.0, expiry_idx=0):
+def fetch_and_analyze_ticker_hybrid_v10(ticker, strategy_type, region="USA", source="Yahoo", z_api=None, z_token=None, pct_1=0.0, pct_2=5.0, expiry_idx=0):
     """Handles logic for USA (Yahoo) and India (NSE Scraper OR Zerodha)."""
     
     # 1. Setup Adapter
@@ -725,7 +725,10 @@ def fetch_and_analyze_ticker_hybrid_v9(ticker, strategy_type, region="USA", sour
             cols_to_numeric = ["Spot Price", "Buy Strike", "Buy Premium", "Sell Strike", "Sell Premium", "Net Cost", "Max Gain", "Breakeven", "Return %", "Cost/CMP %", "Strike", "Call Cost", "Put Cost", "BE Low", "BE High", "Move Needed"]
             for col in cols_to_numeric:
                 if col in df.columns:
+                    # Coerce errors to NaN, then fill with 0.0. 
+                    # Also replace infinite values if any logic caused division by zero.
                     df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
+                    df[col] = df[col].replace([float('inf'), float('-inf')], 0.0)
 
         return summary_returns, df, None
 
@@ -1012,7 +1015,8 @@ def main():
             c_exp, _ = st.columns([1,3])
             exp_opts = ["Current Month", "Next Month", "Far Month"]
             exp_sel = c_exp.selectbox("Select Expiry (India Only)", exp_opts)
-            expiry_idx = exp_opts.index(exp_sel)
+            try: expiry_idx = exp_opts.index(exp_sel)
+            except: expiry_idx = 0
         
         if strategy != "Long Straddle":
             c1, c2 = st.columns(2)
@@ -1040,12 +1044,10 @@ def main():
                 with st.spinner(f"Fetching data..."):
                     for i, ticker in enumerate(tickers):
                         # Renamed function call to bust cache and force fresh data fetch
-                        summary, df, error = fetch_and_analyze_ticker_hybrid_v9(ticker, strategy, region_key, source, z_api, z_token, pct_2, pct_1, expiry_idx)
+                        summary, df, error = fetch_and_analyze_ticker_hybrid_v10(ticker, strategy, region_key, source, z_api, z_token, pct_2, pct_1, expiry_idx)
                         if error: errors.append(f"{ticker}: {error}")
                         else:
                             all_summaries.append(summary)
-                            
-                            # Clean numeric columns to avoid string formatting crash
                             all_details[ticker] = df
                             if not df.empty:
                                 df_summary = df.copy()
@@ -1073,7 +1075,6 @@ def main():
                                 "Net Cost": "${:,.2f}", "Cost/CMP %": "{:.2f}%", "BE Low": "${:,.2f}",
                                 "BE High": "${:,.2f}", "Move Needed": "{:.1f}%"
                             }
-                        # SAFETY WRAPPER FOR STYLING
                         try:
                             st.dataframe(subset.style.format(format_dict), hide_index=True, use_container_width=True)
                         except Exception as e:
@@ -1101,11 +1102,13 @@ def main():
                                     "Net Cost": "${:,.2f}", "Cost/CMP %": "{:.2f}%", "BE Low": "${:,.2f}",
                                     "BE High": "${:,.2f}", "Move Needed": "{:.1f}%"
                                 }
-                            try:
-                                st.dataframe(df.style.format(format_dict), use_container_width=True)
-                            except Exception as e:
-                                st.error(f"⚠️ Formatting error. Showing raw data.")
-                                st.dataframe(df, use_container_width=True)
+                            
+                            if not df.empty:
+                                try:
+                                    st.dataframe(df.style.format(format_dict), use_container_width=True)
+                                except Exception as e:
+                                    st.error(f"⚠️ Formatting error. Showing raw data.")
+                                    st.dataframe(df, use_container_width=True)
                 if errors:
                     with st.expander("Errors"):
                         for e in errors: st.write(f"- {e}")
