@@ -118,7 +118,7 @@ class NSEMarketAdapter:
             if price is None:
                 hist = stock.history(period="1d")
                 if not hist.empty: price = hist['Close'].iloc[-1]
-            return price
+            return float(price) if price is not None else None
         except: return None
 
     def fetch_option_chain_raw(self, ticker):
@@ -153,9 +153,21 @@ class NSEMarketAdapter:
         for item in data:
             if item['expiryDate'] != expiry_date_str: continue
             if 'CE' in item:
-                calls_list.append({'strike': item['CE']['strikePrice'], 'lastPrice': item['CE']['lastPrice'], 'bid': item['CE']['bidprice'], 'ask': item['CE']['askPrice'], 'openInterest': item['CE']['openInterest']})
+                calls_list.append({
+                    'strike': float(item['CE']['strikePrice']),
+                    'lastPrice': float(item['CE'].get('lastPrice', 0)),
+                    'bid': float(item['CE'].get('bidprice', 0)),
+                    'ask': float(item['CE'].get('askPrice', 0)),
+                    'openInterest': float(item['CE'].get('openInterest', 0))
+                })
             if 'PE' in item:
-                puts_list.append({'strike': item['PE']['strikePrice'], 'lastPrice': item['PE']['lastPrice'], 'bid': item['PE']['bidprice'], 'ask': item['PE']['askPrice'], 'openInterest': item['PE']['openInterest']})
+                puts_list.append({
+                    'strike': float(item['PE']['strikePrice']),
+                    'lastPrice': float(item['PE'].get('lastPrice', 0)),
+                    'bid': float(item['PE'].get('bidprice', 0)),
+                    'ask': float(item['PE'].get('askPrice', 0)),
+                    'openInterest': float(item['PE'].get('openInterest', 0))
+                })
         return pd.DataFrame(calls_list), pd.DataFrame(puts_list)
 
 class ZerodhaMarketAdapter:
@@ -195,15 +207,13 @@ class ZerodhaMarketAdapter:
         try:
             stock = yf.Ticker(yf_ticker)
             price = stock.fast_info['last_price']
-            return price
+            return float(price) if price is not None else None
         except: return None
 
     def get_chain_for_symbol(self, ticker, days_limit=90):
         if self.instruments is None:
             self.instruments = self.get_instruments()
             
-        # Filter instruments for this ticker
-        # Zerodha names: "NIFTY" or "INFY"
         df = self.instruments
         
         # Handle Indices vs Stocks
@@ -329,12 +339,13 @@ class ZerodhaMarketAdapter:
             buy = depth.get('buy', [{}])[0]
             sell = depth.get('sell', [{}])[0]
             
+            # FORCE FLOATS
             data = {
-                'strike': row['strike'],
-                'lastPrice': q.get('last_price', 0),
-                'bid': buy.get('price', 0),
-                'ask': sell.get('price', 0),
-                'openInterest': q.get('oi', 0),
+                'strike': float(row['strike']),
+                'lastPrice': float(q.get('last_price', 0.0)),
+                'bid': float(buy.get('price', 0.0)),
+                'ask': float(sell.get('price', 0.0)),
+                'openInterest': float(q.get('oi', 0.0)),
                 'instrument_token': token # Store for margin calc
             }
             
@@ -451,9 +462,13 @@ def find_closest_strike(chain, price_target):
     return chain.sort_values('abs_diff').iloc[0]
 
 def get_price(option_row, price_type='mid'):
-    bid = option_row.get('bid', 0)
-    ask = option_row.get('ask', 0)
-    last = option_row.get('lastPrice', 0)
+    # Force float conversion to avoid string errors
+    try:
+        bid = float(option_row.get('bid', 0.0))
+        ask = float(option_row.get('ask', 0.0))
+        last = float(option_row.get('lastPrice', 0.0))
+    except:
+        return 0.0
     
     if price_type == 'mid':
         if bid > 0 and ask > 0: return (bid + ask) / 2
@@ -478,7 +493,7 @@ def get_option_chain_with_retry(stock, date, retries=3):
 # ==========================================
 
 @st.cache_data(ttl=600, show_spinner=False)
-def fetch_and_analyze_ticker_hybrid_v6(ticker, strategy_type, region="USA", source="Yahoo", z_api=None, z_token=None, pct_1=0.0, pct_2=5.0, expiry_idx=0):
+def fetch_and_analyze_ticker_hybrid_v7(ticker, strategy_type, region="USA", source="Yahoo", z_api=None, z_token=None, pct_1=0.0, pct_2=5.0, expiry_idx=0):
     """Handles logic for USA (Yahoo) and India (NSE Scraper OR Zerodha)."""
     
     # 1. Setup Adapter
@@ -653,6 +668,10 @@ def fetch_and_analyze_ticker_hybrid_v6(ticker, strategy_type, region="USA", sour
                     
                 # -- COMMON OUTPUT --
                 if strategy_type != "Long Straddle":
+                    cost_cmp_pct = 0.0
+                    if margin > 0 and current_price > 0:
+                        cost_cmp_pct = (margin / current_price) * 100
+
                     analysis_rows.append({
                         "Expiration": date_str, 
                         "Spot Price": float(current_price),
@@ -661,7 +680,7 @@ def fetch_and_analyze_ticker_hybrid_v6(ticker, strategy_type, region="USA", sour
                         "Sell Strike": sell_strike, 
                         "Sell Premium": sell_prem, 
                         "Net Cost": net_cost,
-                        "Cost/CMP %": (margin/current_price)*100 if margin > 0 else 0.0,
+                        "Cost/CMP %": cost_cmp_pct,
                         "Max Gain": max_gain, 
                         "Return %": ret_pct, 
                         "Breakeven": breakeven
@@ -681,10 +700,15 @@ def fetch_and_analyze_ticker_hybrid_v6(ticker, strategy_type, region="USA", sour
                     c_ask, p_ask = get_price(c, 'ask'), get_price(p, 'ask')
                     if c_ask == 0 or p_ask == 0: continue
                     net_cost = c_ask + p_ask
+                    
+                    cost_cmp_pct = 0.0
+                    if current_price > 0:
+                        cost_cmp_pct = (net_cost / current_price) * 100
+                        
                     analysis_rows.append({
                         "Expiration": date_str, "Spot Price": float(current_price), "Strike": strike, 
                         "Call Cost": c_ask, "Put Cost": p_ask, "Net Cost": net_cost, 
-                        "Cost/CMP %": (net_cost/current_price)*100,
+                        "Cost/CMP %": cost_cmp_pct,
                         "BE Low": strike - net_cost, "BE High": strike + net_cost, "Move Needed": (net_cost / current_price) * 100
                     })
                     summary_returns[date_str] = f"±{ (net_cost / current_price) * 100:.1f}%"
@@ -1005,7 +1029,7 @@ def main():
                 with st.spinner(f"Fetching data..."):
                     for i, ticker in enumerate(tickers):
                         # Renamed function call to bust cache and force fresh data fetch
-                        summary, df, error = fetch_and_analyze_ticker_hybrid_v6(ticker, strategy, region_key, source, z_api, z_token, pct_2, pct_1, expiry_idx)
+                        summary, df, error = fetch_and_analyze_ticker_hybrid_v7(ticker, strategy, region_key, source, z_api, z_token, pct_2, pct_1, expiry_idx)
                         if error: errors.append(f"{ticker}: {error}")
                         else:
                             all_summaries.append(summary)
