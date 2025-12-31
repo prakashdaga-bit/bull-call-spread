@@ -9,6 +9,7 @@ import requests
 import os
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Union
+from io import StringIO
 
 # ==========================================
 # GLOBAL CONFIGURATION
@@ -16,27 +17,45 @@ from typing import List, Optional, Dict, Union
 st.set_page_config(page_title="Options Strategy Master", page_icon="📈", layout="wide")
 
 # ==========================================
-# TICKER PRESETS
+# NSE HELPERS (LOT SIZES)
 # ==========================================
 @st.cache_data(ttl=86400) # Cache for 1 day
-def get_nse_fo_stocks():
-    """Fetches list of F&O stocks from NSE."""
+def get_nse_lot_sizes():
+    """Fetches dictionary of {Symbol: LotSize} from NSE."""
     try:
         url = "https://nsearchives.nseindia.com/content/fo/fo_mktlots.csv"
-        # Mimic browser to avoid 403
         headers = {'User-Agent': 'Mozilla/5.0'}
         response = requests.get(url, headers=headers)
         if response.status_code == 200:
-            from io import StringIO
-            df = pd.read_csv(StringIO(response.text))
+            # Clean text to handle potential bad formatting
+            csv_data = response.text.replace('\r', '')
+            df = pd.read_csv(StringIO(csv_data))
             df.columns = [c.strip().upper() for c in df.columns]
-            if 'SYMBOL' in df.columns:
-                symbols = [x.strip() for x in df['SYMBOL'].astype(str).unique() if x.strip().upper() not in ["SYMBOL", "NAN"]]
-                return ", ".join(sorted(symbols))
+            
+            # Look for SYMBOL and the column containing LOT size (usually matches 'LOT')
+            lot_col = next((c for c in df.columns if "LOT" in c), None)
+            sym_col = next((c for c in df.columns if "SYMBOL" in c), None)
+            
+            if lot_col and sym_col:
+                # Create a cleaned dictionary
+                # Remove rows where Symbol is missing or Lot is not a number
+                df = df.dropna(subset=[sym_col, lot_col])
+                
+                # Helper to clean lot strings (remove commas, spaces)
+                def clean_lot(val):
+                    try:
+                        return int(str(val).replace(',', '').strip())
+                    except:
+                        return 1
+                        
+                return dict(zip(df[sym_col].str.strip(), df[lot_col].apply(clean_lot)))
     except:
         pass
-    return "RELIANCE, TCS, HDFCBANK, ICICIBANK, INFY, ITC, SBIN, BHARTIARTL, HINDUNILVR, LTIM, TATAMOTORS, M&M, MARUTI, BAJAJ-AUTO"
+    return {}
 
+# ==========================================
+# TICKER PRESETS
+# ==========================================
 def get_ticker_presets(region="USA"):
     presets = {
         "Custom / Manual Input": ""
@@ -49,7 +68,10 @@ def get_ticker_presets(region="USA"):
             "NASDAQ 100 (Top 25)": "AAPL, MSFT, NVDA, AMZN, GOOGL, META, AVGO, TSLA, GOOG, COST, AMD, NFLX, PEP, ADBE, LIN, CSCO, TMUS, QCOM, INTC, AMGN, INTU, TXN, CMCSA, AMAT, HON"
         })
     else:
-        fo_list = get_nse_fo_stocks()
+        # Fetch NSE list for keys
+        lots = get_nse_lot_sizes()
+        fo_list = ", ".join(sorted(lots.keys())) if lots else "RELIANCE, TCS, HDFCBANK, ICICIBANK, INFY, ITC, SBIN, BHARTIARTL, HINDUNILVR, LTIM"
+        
         presets.update({
             "NIFTY 50 Top 10": "RELIANCE, TCS, HDFCBANK, ICICIBANK, INFY, ITC, SBIN, BHARTIARTL, HINDUNILVR, LTIM",
             "Indices": "NIFTY, BANKNIFTY, FINNIFTY",
@@ -97,9 +119,12 @@ class NSEMarketAdapter:
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "*/*",
             "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br"
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Referer": "https://www.nseindia.com/option-chain"
         })
         try:
             self.session.get(self.BASE_URL, timeout=5)
@@ -120,9 +145,18 @@ class NSEMarketAdapter:
                 if not hist.empty: price = hist['Close'].iloc[-1]
             return float(price) if price is not None else None
         except: return None
+        
+    def get_lot_size(self, ticker):
+        """Fetches lot size from NSE Archives."""
+        lots = get_nse_lot_sizes()
+        return lots.get(ticker, 1)
 
     def fetch_option_chain_raw(self, ticker):
-        url = f"https://www.nseindia.com/api/option-chain-indices?symbol={ticker}" if ticker in self.INDICES else f"https://www.nseindia.com/api/option-chain-equities?symbol={ticker}"
+        if ticker in self.INDICES:
+            url = f"https://www.nseindia.com/api/option-chain-indices?symbol={ticker}"
+        else:
+            url = f"https://www.nseindia.com/api/option-chain-equities?symbol={ticker.upper()}"
+            
         try:
             response = self.session.get(url, timeout=10)
             if response.status_code == 401:
@@ -173,7 +207,6 @@ class NSEMarketAdapter:
 class ZerodhaMarketAdapter:
     """
     Uses Kite Connect API to fetch option chains.
-    Requires 'kiteconnect' package: pip install kiteconnect
     """
     def __init__(self, api_key, access_token):
         self.api_key = api_key.strip()
@@ -194,14 +227,11 @@ class ZerodhaMarketAdapter:
             st.error(f"Zerodha Connection Error: {e}")
             return False
 
-    @st.cache_data(ttl=3600) # Cache instruments for 1 hour
+    @st.cache_data(ttl=3600)
     def get_instruments(_self):
         return pd.DataFrame(_self.kite.instruments("NFO"))
 
     def get_spot_price(self, ticker):
-        # Fallback to Yahoo for Spot price to save API calls or complex logic
-        # Or fetch from NSE equity if needed. Using Yahoo for simplicity as it's free.
-        # Mapping for indices
         idx_map = {"NIFTY": "^NSEI", "BANKNIFTY": "^NSEBANK", "FINNIFTY": "NIFTY_FIN_SERVICE.NS"}
         yf_ticker = idx_map.get(ticker, f"{ticker}.NS")
         try:
@@ -215,8 +245,6 @@ class ZerodhaMarketAdapter:
             self.instruments = self.get_instruments()
             
         df = self.instruments
-        
-        # Handle Indices vs Stocks
         name = ticker
         if ticker == "NIFTY": name = "NIFTY"
         elif ticker == "BANKNIFTY": name = "BANKNIFTY"
@@ -225,23 +253,17 @@ class ZerodhaMarketAdapter:
         subset = df[df['name'] == name].copy()
         if subset.empty: return [], {}
         
-        # Parse Expiry
         subset['expiry'] = pd.to_datetime(subset['expiry']).dt.date
         today = datetime.date.today()
         limit = today + datetime.timedelta(days=days_limit)
         
         valid_subset = subset[(subset['expiry'] >= today) & (subset['expiry'] <= limit)]
         unique_dates = sorted(valid_subset['expiry'].unique())
-        
-        # Limit to 3
         unique_dates = unique_dates[:3]
         
         return unique_dates, valid_subset
 
     def fetch_quotes(self, instrument_tokens):
-        # Zerodha allows multi-quote. 
-        # Batches of 500? Check documentation. 
-        # For simplicity, passing list directly.
         try:
             quotes = {}
             chunk_size = 500
@@ -252,13 +274,11 @@ class ZerodhaMarketAdapter:
                 time.sleep(0.1)
             return quotes
         except Exception as e:
-            st.error(f"Quote Fetch Error: {e}")
             return {}
 
     def get_lot_size(self, ticker):
         if self.instruments is None:
             self.instruments = self.get_instruments()
-        # Find first matching record
         name = ticker
         if ticker == "NIFTY": name = "NIFTY"
         elif ticker == "BANKNIFTY": name = "BANKNIFTY"
@@ -269,68 +289,38 @@ class ZerodhaMarketAdapter:
         return 1
 
     def get_margin_for_basket(self, legs, lot_size=1):
-        """
-        Uses Kite Connect Order Margin API to get SPAN + Exposure margin.
-        legs: list of dicts with keys: 'row' (contains tradingsymbol), 'action' ('Buy'/'Sell'), 'type' ('Call'/'Put')
-        """
         if not self.kite: return 0.0
-        
         orders = []
         for leg in legs:
-            # Need tradingsymbol from cached instruments
-            token = leg['row'].get('instrument_token') # We stored this in parse_chain for Zerodha
-            
-            # Find tradingsymbol from instruments df
+            token = leg['row'].get('instrument_token')
             if self.instruments is not None and token:
                 row = self.instruments[self.instruments['instrument_token'] == token]
                 if not row.empty:
                     ts = row.iloc[0]['tradingsymbol']
                     txn_type = self.kite.TRANSACTION_TYPE_BUY if leg['action'] == "Buy" else self.kite.TRANSACTION_TYPE_SELL
-                    
                     orders.append({
-                        "exchange": "NFO",
-                        "tradingsymbol": ts,
-                        "transaction_type": txn_type,
-                        "variety": "regular",
-                        "product": "NRML",
-                        "order_type": "MARKET",
-                        "quantity": lot_size
+                        "exchange": "NFO", "tradingsymbol": ts, "transaction_type": txn_type,
+                        "variety": "regular", "product": "NRML", "order_type": "MARKET", "quantity": lot_size
                     })
-        
         if not orders: return 0.0
-        
         try:
-            # basket_margin returns detailed breakdown
             response = self.kite.basket_order_margins(orders)
-            # We want 'total' margin required for the final portfolio
-            # basket_order_margins returns details about initial and final margin
-            # We typically look at 'final' keys or initial depending on what user needs to place.
-            # Usually 'initial' margin is what blocks funds.
             if response and 'initial' in response:
                 return response['initial'].get('total', 0.0)
             return 0.0
-        except Exception as e:
-            # st.error(f"Margin Calc Error: {e}")
-            return 0.0
+        except: return 0.0
 
     def parse_chain(self, valid_instruments, expiry_date):
-        # Filter for specific expiry
         expiry_subset = valid_instruments[valid_instruments['expiry'] == expiry_date]
-        
         if expiry_subset.empty: return pd.DataFrame(), pd.DataFrame()
         
-        # Get Tokens
         tokens = expiry_subset['instrument_token'].tolist()
-        
-        # Fetch Quotes
         quotes = self.fetch_quotes(tokens)
         
-        calls_list = []
-        puts_list = []
+        calls_list, puts_list = [], []
         
         for _, row in expiry_subset.iterrows():
             token = row['instrument_token']
-            # ROBUST CHECK: Try both int and string key lookup
             q = quotes.get(token) or quotes.get(str(token))
             
             if not q: continue
@@ -339,20 +329,16 @@ class ZerodhaMarketAdapter:
             buy = depth.get('buy', [{}])[0]
             sell = depth.get('sell', [{}])[0]
             
-            # FORCE FLOATS
             data = {
                 'strike': float(row['strike']),
                 'lastPrice': float(q.get('last_price', 0.0)),
                 'bid': float(buy.get('price', 0.0)),
                 'ask': float(sell.get('price', 0.0)),
                 'openInterest': float(q.get('oi', 0.0)),
-                'instrument_token': token # Store for margin calc
+                'instrument_token': token
             }
-            
-            if row['instrument_type'] == 'CE':
-                calls_list.append(data)
-            elif row['instrument_type'] == 'PE':
-                puts_list.append(data)
+            if row['instrument_type'] == 'CE': calls_list.append(data)
+            elif row['instrument_type'] == 'PE': puts_list.append(data)
                 
         return pd.DataFrame(calls_list), pd.DataFrame(puts_list)
 
@@ -361,88 +347,52 @@ class ZerodhaMarketAdapter:
 # ==========================================
 
 def get_monthly_expirations(ticker_obj, limit=3):
-    """
-    Filters the list of expiration dates to find the next 'limit' distinct months.
-    Used for Simple Analysis (USA).
-    """
     try:
         expirations = ticker_obj.options
-        if not expirations:
-            return []
-
-        # Convert strings to datetime objects
+        if not expirations: return []
         dates = [datetime.datetime.strptime(date, '%Y-%m-%d') for date in expirations]
-        
-        unique_months = []
-        seen_months = set()
-        
+        unique_months, seen_months = [], set()
         for date in dates:
             month_key = (date.year, date.month)
             if month_key not in seen_months:
                 unique_months.append(date.strftime('%Y-%m-%d'))
                 seen_months.add(month_key)
-            
-            if len(unique_months) >= limit:
-                break
-                
+            if len(unique_months) >= limit: break
         return unique_months
-    except:
-        return []
+    except: return []
 
 def get_expirations_within_days(ticker_obj, days_limit=30):
-    """Returns all expiration dates within the next X days."""
     try:
         expirations = ticker_obj.options
-    except:
-        return []
-        
-    if not expirations:
-        return []
-        
+    except: return []
+    if not expirations: return []
     valid_dates = []
     today = datetime.date.today()
     limit_date = today + datetime.timedelta(days=days_limit)
-    
     for date_str in expirations:
         try:
             exp_date = datetime.datetime.strptime(date_str, '%Y-%m-%d').date()
-            if today <= exp_date <= limit_date:
-                valid_dates.append(date_str)
-        except:
-            continue
-            
+            if today <= exp_date <= limit_date: valid_dates.append(date_str)
+        except: continue
     return valid_dates
 
 def get_next_earnings_date(ticker_obj):
-    """Fetches the next earnings date."""
     try:
-        # Try retrieving calendar
         cal = ticker_obj.calendar
         if cal is not None and not isinstance(cal, list) and bool(cal):
-            # yfinance calendar structure varies; typically 'Earnings Date' row or column
-            # Check if dict-like or dataframe
             if isinstance(cal, dict) and 'Earnings Date' in cal:
                 dates = cal['Earnings Date']
-                if dates:
-                    return dates[0].strftime('%Y-%m-%d')
+                if dates: return dates[0].strftime('%Y-%m-%d')
             elif isinstance(cal, pd.DataFrame):
-                # Try finding row 'Earnings Date'
                 if 'Earnings Date' in cal.index:
                     vals = cal.loc['Earnings Date']
-                    # vals might be a Series or list
-                    if hasattr(vals, 'iloc'):
-                        return vals.iloc[0].strftime('%Y-%m-%d')
-        
-        # Fallback method: get_earnings_dates
+                    if hasattr(vals, 'iloc'): return vals.iloc[0].strftime('%Y-%m-%d')
         dates_df = ticker_obj.get_earnings_dates(limit=4)
         if dates_df is not None and len(dates_df) > 0:
             future_dates = dates_df[dates_df.index > pd.Timestamp.now()]
-            if not future_dates.empty:
-                return future_dates.index[-1].strftime('%Y-%m-%d') # Often sorted desc
-            
+            if not future_dates.empty: return future_dates.index[-1].strftime('%Y-%m-%d')
         return "N/A"
-    except:
-        return "N/A"
+    except: return "N/A"
 
 def filter_tradeable_options(chain):
     if chain.empty: return chain
@@ -462,21 +412,15 @@ def find_closest_strike(chain, price_target):
     return chain.sort_values('abs_diff').iloc[0]
 
 def get_price(option_row, price_type='mid'):
-    # Force float conversion to avoid string errors
     try:
         bid = float(option_row.get('bid', 0.0))
         ask = float(option_row.get('ask', 0.0))
         last = float(option_row.get('lastPrice', 0.0))
-    except:
-        return 0.0
+    except: return 0.0
     
-    if price_type == 'mid':
-        if bid > 0 and ask > 0: return (bid + ask) / 2
-        return last
-    elif price_type == 'ask':
-        return ask if ask > 0 else last
-    elif price_type == 'bid':
-        return bid if bid > 0 else (last * 0.95) 
+    if price_type == 'mid': return (bid + ask) / 2 if (bid > 0 and ask > 0) else last
+    elif price_type == 'ask': return ask if ask > 0 else last
+    elif price_type == 'bid': return bid if bid > 0 else (last * 0.95) 
     return last
 
 def get_option_chain_with_retry(stock, date, retries=3):
@@ -494,77 +438,66 @@ def get_option_chain_with_retry(stock, date, retries=3):
 
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_and_analyze_ticker_hybrid_v12(ticker, strategy_type, region="USA", source="Yahoo", z_api=None, z_token=None, pct_1=0.0, pct_2=5.0, expiry_idx=0):
-    """Handles logic for USA (Yahoo) and India (NSE Scraper OR Zerodha)."""
-    
-    # 1. Setup Adapter
     adapter = None
     if region == "India":
         if source == "Zerodha (API)":
             adapter = ZerodhaMarketAdapter(z_api, z_token)
             if not adapter.connect(): return None, None, "Zerodha Connection Failed"
-        else:
-            adapter = NSEMarketAdapter()
+        else: adapter = NSEMarketAdapter()
     
     try:
-        # 2. Get Spot Price
+        lot_size = 1
         if region == "India":
-            # For NSE scraper, sometimes .NS is added, strip it
             clean_ticker = ticker.replace(".NS", "")
             current_price = adapter.get_spot_price(clean_ticker)
+            if adapter: # Zerodha or NSE
+                # Use get_lot_size from adapter if available (Zerodha) else fallback to NSE CSV
+                if hasattr(adapter, 'get_lot_size'):
+                    lot_size = adapter.get_lot_size(clean_ticker)
+                else:
+                    # Fallback for NSE Adapter
+                    lots = get_nse_lot_sizes()
+                    lot_size = lots.get(clean_ticker, 1)
         else:
             stock = yf.Ticker(ticker)
             try:
                 current_price = stock.fast_info['last_price']
             except:
                 hist = stock.history(period='1d')
-                if not hist.empty: current_price = hist['Close'].iloc[-1]
-                else: current_price = None
+                current_price = hist['Close'].iloc[-1] if not hist.empty else None
 
         if not current_price: return None, None, f"Could not fetch spot price for {ticker}"
 
-        # 3. Get Expirations
         valid_dates = []
-        raw_data = None # For NSE scraper
-        valid_instruments = None # For Zerodha
+        raw_data, valid_instruments = None, None
         
         if region == "India":
             if source == "Zerodha (API)":
                 valid_dates, valid_instruments = adapter.get_chain_for_symbol(clean_ticker)
             else:
                 valid_dates, raw_data = adapter.get_expirations(clean_ticker, days_limit=90)
-                if valid_dates: valid_dates = valid_dates[:3] # Default max 3
+                if valid_dates: valid_dates = valid_dates[:3]
         else:
             stock = yf.Ticker(ticker)
-            try:
-                # Use Monthly Logic for Simple Analysis
-                valid_dates = get_monthly_expirations(stock, limit=3)
+            try: valid_dates = get_monthly_expirations(stock, limit=3)
             except: pass
 
         if not valid_dates: return None, None, "No valid expirations found."
         
-        # --- EXPIRY FILTERING FOR INDIA ---
         if region == "India" and valid_dates:
-            if expiry_idx < len(valid_dates):
-                valid_dates = [valid_dates[expiry_idx]]
-            else:
-                valid_dates = [valid_dates[-1]] # Fallback to furthest if index out of bounds
+            valid_dates = [valid_dates[expiry_idx]] if expiry_idx < len(valid_dates) else [valid_dates[-1]]
 
         analysis_rows = []
         summary_returns = {"Stock": ticker}
 
         for date_obj in valid_dates:
-            # 4. Get Option Chain
             calls, puts = pd.DataFrame(), pd.DataFrame()
-            
-            # Date Handling (Zerodha returns date objects, others strings)
             if isinstance(date_obj, datetime.date): date_str = date_obj.strftime('%Y-%m-%d')
             else: date_str = date_obj
             
             if region == "India":
-                if source == "Zerodha (API)":
-                    calls, puts = adapter.parse_chain(valid_instruments, date_obj) # Pass date object
-                else:
-                    calls, puts = adapter.parse_chain(raw_data, date_str)
+                if source == "Zerodha (API)": calls, puts = adapter.parse_chain(valid_instruments, date_obj)
+                else: calls, puts = adapter.parse_chain(raw_data, date_str)
             else:
                 try:
                     chain = stock.option_chain(date_str)
@@ -573,23 +506,20 @@ def fetch_and_analyze_ticker_hybrid_v12(ticker, strategy_type, region="USA", sou
 
             calls = filter_tradeable_options(calls)
             puts = filter_tradeable_options(puts)
-            
             if calls.empty or puts.empty: continue
 
-            # 5. Run Simple Strategy Logic
             try:
                 # Common Vars
                 buy_leg, sell_leg = None, None
-                buy_strike, sell_strike = 0, 0
-                buy_prem, sell_prem = 0, 0
-                net_cost, max_gain, breakeven, ret_pct, margin = 0, 0, 0, 0, 0
+                buy_strike, sell_strike = 0.0, 0.0
+                buy_prem, sell_prem = 0.0, 0.0
+                net_cost, max_gain, breakeven, ret_pct, margin = 0.0, 0.0, 0.0, 0.0, 0.0
                 
                 # Targets
                 price_1 = current_price * (1 + pct_1/100.0)
                 price_2 = current_price * (1 + pct_2/100.0)
                 
                 if strategy_type == "Bull Call Spread":
-                    # Buy Low Call, Sell High Call (Debit)
                     leg_a = find_closest_strike(calls, price_1)
                     leg_b = find_closest_strike(calls, price_2)
                     
@@ -609,7 +539,6 @@ def fetch_and_analyze_ticker_hybrid_v12(ticker, strategy_type, region="USA", sou
                     if net_cost > 0: ret_pct = ((max_gain - net_cost) / net_cost) * 100
 
                 elif strategy_type == "Bear Call Spread":
-                    # Sell Low Call, Buy High Call (Credit)
                     leg_a = find_closest_strike(calls, price_1)
                     leg_b = find_closest_strike(calls, price_2)
                     
@@ -621,14 +550,13 @@ def fetch_and_analyze_ticker_hybrid_v12(ticker, strategy_type, region="USA", sou
                     buy_strike, sell_strike = buy_leg['strike'], sell_leg['strike']
                     buy_prem, sell_prem = get_price(buy_leg, 'ask'), get_price(sell_leg, 'bid')
                     
-                    net_cost = buy_prem - sell_prem # Credit
+                    net_cost = buy_prem - sell_prem
                     max_gain = abs(net_cost)
                     margin = (buy_strike - sell_strike)
                     breakeven = sell_strike + max_gain
                     if margin > 0: ret_pct = (max_gain / margin) * 100
 
                 elif strategy_type == "Bull Put Spread":
-                    # Buy Low Put, Sell High Put (Credit)
                     leg_a = find_closest_strike(puts, price_1)
                     leg_b = find_closest_strike(puts, price_2)
                     
@@ -640,14 +568,13 @@ def fetch_and_analyze_ticker_hybrid_v12(ticker, strategy_type, region="USA", sou
                     buy_strike, sell_strike = buy_leg['strike'], sell_leg['strike']
                     buy_prem, sell_prem = get_price(buy_leg, 'ask'), get_price(sell_leg, 'bid')
                     
-                    net_cost = buy_prem - sell_prem # Credit
+                    net_cost = buy_prem - sell_prem
                     max_gain = abs(net_cost)
                     margin = (sell_strike - buy_strike)
                     breakeven = sell_strike - max_gain
                     if margin > 0: ret_pct = (max_gain / margin) * 100
 
                 elif strategy_type == "Bear Put Spread":
-                    # Sell Low Put, Buy High Put (Debit)
                     leg_a = find_closest_strike(puts, price_1)
                     leg_b = find_closest_strike(puts, price_2)
                     
@@ -660,13 +587,12 @@ def fetch_and_analyze_ticker_hybrid_v12(ticker, strategy_type, region="USA", sou
                     buy_prem, sell_prem = get_price(buy_leg, 'ask'), get_price(sell_leg, 'bid')
                     
                     if buy_prem == 0: continue
-                    net_cost = buy_prem - sell_prem # Debit
+                    net_cost = buy_prem - sell_prem
                     max_gain = buy_strike - sell_strike
                     breakeven = buy_strike - net_cost
                     margin = net_cost
                     if net_cost > 0: ret_pct = ((max_gain - net_cost) / net_cost) * 100
                     
-                # -- COMMON OUTPUT --
                 if strategy_type != "Long Straddle":
                     cost_cmp_pct = 0.0
                     if margin > 0 and current_price > 0:
@@ -675,6 +601,7 @@ def fetch_and_analyze_ticker_hybrid_v12(ticker, strategy_type, region="USA", sou
                     analysis_rows.append({
                         "Expiration": date_str, 
                         "Spot Price": float(current_price),
+                        "Lot Size": lot_size,
                         "Buy Strike": buy_strike, 
                         "Buy Premium": buy_prem,
                         "Sell Strike": sell_strike, 
@@ -687,7 +614,6 @@ def fetch_and_analyze_ticker_hybrid_v12(ticker, strategy_type, region="USA", sou
                     })
                     summary_returns[date_str] = f"{ret_pct:.1f}%"
                 
-                # STRADDLE Logic preserved
                 elif strategy_type == "Long Straddle":
                     common = set(calls['strike']).intersection(set(puts['strike']))
                     if not common: continue
@@ -706,10 +632,11 @@ def fetch_and_analyze_ticker_hybrid_v12(ticker, strategy_type, region="USA", sou
                         cost_cmp_pct = (net_cost / current_price) * 100
                         
                     analysis_rows.append({
-                        "Expiration": date_str, "Spot Price": float(current_price), "Strike": strike, 
-                        "Call Cost": c_ask, "Put Cost": p_ask, "Net Cost": net_cost, 
+                        "Expiration": date_str, "Spot Price": float(current_price), "Lot Size": lot_size,
+                        "Strike": strike, "Call Cost": c_ask, "Put Cost": p_ask, "Net Cost": net_cost, 
                         "Cost/CMP %": cost_cmp_pct,
-                        "BE Low": strike - net_cost, "BE High": strike + net_cost, "Move Needed": (net_cost / current_price) * 100
+                        "BE Low": strike - net_cost, "BE High": strike + net_cost, 
+                        "Move Needed": (net_cost / current_price) * 100
                     })
                     summary_returns[date_str] = f"±{ (net_cost / current_price) * 100:.1f}%"
 
@@ -717,16 +644,12 @@ def fetch_and_analyze_ticker_hybrid_v12(ticker, strategy_type, region="USA", sou
 
         if not analysis_rows: return None, None, "Could not build strategies."
         
-        # Convert to DataFrame
         df = pd.DataFrame(analysis_rows)
         
-        # Data Cleaning: Force Numeric Types
         if not df.empty:
-            cols_to_numeric = ["Spot Price", "Buy Strike", "Buy Premium", "Sell Strike", "Sell Premium", "Net Cost", "Max Gain", "Breakeven", "Return %", "Cost/CMP %", "Strike", "Call Cost", "Put Cost", "BE Low", "BE High", "Move Needed"]
+            cols_to_numeric = ["Spot Price", "Lot Size", "Buy Strike", "Buy Premium", "Sell Strike", "Sell Premium", "Net Cost", "Max Gain", "Breakeven", "Return %", "Cost/CMP %", "Strike", "Call Cost", "Put Cost", "BE Low", "BE High", "Move Needed", "Margin Required"]
             for col in cols_to_numeric:
                 if col in df.columns:
-                    # Coerce errors to NaN, then fill with 0.0. 
-                    # Also replace infinite values if any logic caused division by zero.
                     df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
                     df[col] = df[col].replace([float('inf'), float('-inf')], 0.0)
 
@@ -772,7 +695,6 @@ def calculate_strategy_metrics(legs, current_price, view, lot_size=1, adapter=No
         if api_margin > 0: capital_required = api_margin
     
     if capital_required == 0:
-        # Fallback logic
         total_premium_lot = net_premium * lot_size
         puts = sorted([l for l in legs if l['type'] == 'Put'], key=lambda x: x['row']['strike'])
         calls = sorted([l for l in legs if l['type'] == 'Call'], key=lambda x: x['row']['strike'])
@@ -804,7 +726,11 @@ def analyze_custom_strategy(ticker, view, slab1_pct, slab2_pct, days_window, reg
         if region == "India":
             clean_ticker = ticker.replace(".NS", "")
             current_price = adapter.get_spot_price(clean_ticker)
-            if source == "Zerodha (API)": lot_size = adapter.get_lot_size(clean_ticker)
+            if adapter:
+                if hasattr(adapter, 'get_lot_size'): lot_size = adapter.get_lot_size(clean_ticker)
+                else: 
+                     lots = get_nse_lot_sizes()
+                     lot_size = lots.get(clean_ticker, 1)
             try:
                 stock = yf.Ticker(f"{clean_ticker}.NS")
                 earnings_date = get_next_earnings_date(stock)
@@ -978,24 +904,15 @@ def main():
         source = st.sidebar.radio("India Data Source", ["NSE Website (Free/Flaky)", "Zerodha (API)"])
         if source == "Zerodha (API)":
             st.sidebar.info("Requires Kite Connect subscription.")
-            if saved_api and saved_api != st.session_state.get("z_api_input", ""):
-                 st.session_state["z_api_input"] = saved_api
-            if saved_token and saved_token != st.session_state.get("z_token_input", ""):
-                 st.session_state["z_token_input"] = saved_token
-            
-            z_api = st.sidebar.text_input("API Key", key="z_api_input", type="password")
-            z_token = st.sidebar.text_input("Access Token", key="z_token_input", type="password")
-            
-            if st.sidebar.button("Force Reload Token File"):
-                st.cache_data.clear()
-                st.rerun()
-
+            z_api = st.sidebar.text_input("API Key", value=saved_api if saved_api else "", type="password")
+            z_token = st.sidebar.text_input("Access Token", value=saved_token if saved_token else "", type="password")
+        
         # Check token file age
         file_dt = get_token_file_info()
         if file_dt:
              hours_old = (datetime.datetime.now() - file_dt).total_seconds() / 3600
              if hours_old > 12:
-                 st.sidebar.warning(f"⚠️ Token file is {hours_old:.1f} hours old.")
+                 st.sidebar.warning(f"⚠️ Token file is {hours_old:.1f} hours old. Auto-login might have failed.")
              else:
                  st.sidebar.success(f"✅ Token updated: {file_dt.strftime('%H:%M')}")
     
@@ -1058,6 +975,7 @@ def main():
                         else:
                             all_summaries.append(summary)
                             
+                            # Clean numeric columns to avoid string formatting crash
                             all_details[ticker] = df
                             if not df.empty:
                                 df_summary = df.copy()
@@ -1077,6 +995,7 @@ def main():
                             format_dict = {
                                 "Spot Price": "${:,.2f}", "Buy Premium": "${:,.2f}", "Sell Premium": "${:,.2f}",
                                 "Net Cost": "${:,.2f}", "Cost/CMP %": "{:.2f}%", "Max Gain": "${:,.2f}",
+                                "Margin Required": "${:,.0f}",
                                 "Breakeven": "${:,.2f}", "Return %": "{:.1f}%"
                             }
                         else:
@@ -1103,6 +1022,7 @@ def main():
                                 format_dict = {
                                     "Spot Price": "${:,.2f}", "Buy Premium": "${:,.2f}", "Sell Premium": "${:,.2f}",
                                     "Net Cost": "${:,.2f}", "Cost/CMP %": "{:.2f}%", "Max Gain": "${:,.2f}",
+                                    "Margin Required": "${:,.0f}",
                                     "Breakeven": "${:,.2f}", "Return %": "{:.1f}%"
                                 }
                             else:
@@ -1165,7 +1085,8 @@ def main():
                                     "Margin (1 Lot)": f"${metrics['capital_required']:,.0f}",
                                     "Net Max Profit": f"${metrics['net_max_profit']:,.0f}",
                                     "ROI": f"{metrics['roi']:.1f}%",
-                                    "Est. Brokerage": f"${metrics['brokerage']:.2f}"
+                                    "Est. Brokerage": f"${metrics['brokerage']:.2f}",
+                                    "Lot Size": metrics['lot_size']
                                 }
                                 all_summaries.append(summary_data)
                         progress_bar.progress((i + 1) / len(tickers))
