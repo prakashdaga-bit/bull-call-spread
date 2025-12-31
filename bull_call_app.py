@@ -282,7 +282,6 @@ class ZerodhaMarketAdapter:
         name = ticker
         if ticker == "NIFTY": name = "NIFTY"
         elif ticker == "BANKNIFTY": name = "BANKNIFTY"
-        
         subset = self.instruments[self.instruments['name'] == name]
         if not subset.empty:
             return int(subset.iloc[0]['lot_size'])
@@ -437,21 +436,26 @@ def get_option_chain_with_retry(stock, date, retries=3):
 # ==========================================
 
 @st.cache_data(ttl=600, show_spinner=False)
-def fetch_and_analyze_ticker_hybrid_v12(ticker, strategy_type, region="USA", source="Yahoo", z_api=None, z_token=None, pct_1=0.0, pct_2=5.0, expiry_idx=0):
+def fetch_and_analyze_ticker_hybrid_v13(ticker, strategy_type, region="USA", source="Yahoo", z_api=None, z_token=None, pct_1=0.0, pct_2=5.0, expiry_idx=0):
+    """Handles logic for USA (Yahoo) and India (NSE Scraper OR Zerodha)."""
+    
+    # 1. Setup Adapter
     adapter = None
     if region == "India":
         if source == "Zerodha (API)":
             adapter = ZerodhaMarketAdapter(z_api, z_token)
             if not adapter.connect(): return None, None, "Zerodha Connection Failed"
-        else: adapter = NSEMarketAdapter()
+        else:
+            adapter = NSEMarketAdapter()
     
     try:
+        # 2. Get Spot Price
         lot_size = 1
         if region == "India":
+            # For NSE scraper, sometimes .NS is added, strip it
             clean_ticker = ticker.replace(".NS", "")
             current_price = adapter.get_spot_price(clean_ticker)
             if adapter: # Zerodha or NSE
-                # Use get_lot_size from adapter if available (Zerodha) else fallback to NSE CSV
                 if hasattr(adapter, 'get_lot_size'):
                     lot_size = adapter.get_lot_size(clean_ticker)
                 else:
@@ -464,40 +468,54 @@ def fetch_and_analyze_ticker_hybrid_v12(ticker, strategy_type, region="USA", sou
                 current_price = stock.fast_info['last_price']
             except:
                 hist = stock.history(period='1d')
-                current_price = hist['Close'].iloc[-1] if not hist.empty else None
+                if not hist.empty: current_price = hist['Close'].iloc[-1]
+                else: current_price = None
 
         if not current_price: return None, None, f"Could not fetch spot price for {ticker}"
 
+        # 3. Get Expirations
         valid_dates = []
-        raw_data, valid_instruments = None, None
+        raw_data = None # For NSE scraper
+        valid_instruments = None # For Zerodha
         
         if region == "India":
             if source == "Zerodha (API)":
                 valid_dates, valid_instruments = adapter.get_chain_for_symbol(clean_ticker)
             else:
                 valid_dates, raw_data = adapter.get_expirations(clean_ticker, days_limit=90)
-                if valid_dates: valid_dates = valid_dates[:3]
+                if valid_dates: valid_dates = valid_dates[:3] # Default max 3
         else:
             stock = yf.Ticker(ticker)
-            try: valid_dates = get_monthly_expirations(stock, limit=3)
+            try:
+                # Use Monthly Logic for Simple Analysis
+                valid_dates = get_monthly_expirations(stock, limit=3)
             except: pass
 
         if not valid_dates: return None, None, "No valid expirations found."
         
+        # --- EXPIRY FILTERING FOR INDIA ---
         if region == "India" and valid_dates:
-            valid_dates = [valid_dates[expiry_idx]] if expiry_idx < len(valid_dates) else [valid_dates[-1]]
+            if expiry_idx < len(valid_dates):
+                valid_dates = [valid_dates[expiry_idx]]
+            else:
+                valid_dates = [valid_dates[-1]] # Fallback to furthest if index out of bounds
 
         analysis_rows = []
         summary_returns = {"Stock": ticker}
 
         for date_obj in valid_dates:
+            # 4. Get Option Chain
             calls, puts = pd.DataFrame(), pd.DataFrame()
+            
+            # Date Handling (Zerodha returns date objects, others strings)
             if isinstance(date_obj, datetime.date): date_str = date_obj.strftime('%Y-%m-%d')
             else: date_str = date_obj
             
             if region == "India":
-                if source == "Zerodha (API)": calls, puts = adapter.parse_chain(valid_instruments, date_obj)
-                else: calls, puts = adapter.parse_chain(raw_data, date_str)
+                if source == "Zerodha (API)":
+                    calls, puts = adapter.parse_chain(valid_instruments, date_obj) # Pass date object
+                else:
+                    calls, puts = adapter.parse_chain(raw_data, date_str)
             else:
                 try:
                     chain = stock.option_chain(date_str)
@@ -506,8 +524,10 @@ def fetch_and_analyze_ticker_hybrid_v12(ticker, strategy_type, region="USA", sou
 
             calls = filter_tradeable_options(calls)
             puts = filter_tradeable_options(puts)
+            
             if calls.empty or puts.empty: continue
 
+            # 5. Run Simple Strategy Logic
             try:
                 # Common Vars
                 buy_leg, sell_leg = None, None
@@ -520,6 +540,7 @@ def fetch_and_analyze_ticker_hybrid_v12(ticker, strategy_type, region="USA", sou
                 price_2 = current_price * (1 + pct_2/100.0)
                 
                 if strategy_type == "Bull Call Spread":
+                    # Buy Low Call, Sell High Call (Debit)
                     leg_a = find_closest_strike(calls, price_1)
                     leg_b = find_closest_strike(calls, price_2)
                     
@@ -539,6 +560,7 @@ def fetch_and_analyze_ticker_hybrid_v12(ticker, strategy_type, region="USA", sou
                     if net_cost > 0: ret_pct = ((max_gain - net_cost) / net_cost) * 100
 
                 elif strategy_type == "Bear Call Spread":
+                    # Sell Low Call, Buy High Call (Credit)
                     leg_a = find_closest_strike(calls, price_1)
                     leg_b = find_closest_strike(calls, price_2)
                     
@@ -550,13 +572,14 @@ def fetch_and_analyze_ticker_hybrid_v12(ticker, strategy_type, region="USA", sou
                     buy_strike, sell_strike = buy_leg['strike'], sell_leg['strike']
                     buy_prem, sell_prem = get_price(buy_leg, 'ask'), get_price(sell_leg, 'bid')
                     
-                    net_cost = buy_prem - sell_prem
+                    net_cost = buy_prem - sell_prem # Credit
                     max_gain = abs(net_cost)
                     margin = (buy_strike - sell_strike)
                     breakeven = sell_strike + max_gain
                     if margin > 0: ret_pct = (max_gain / margin) * 100
 
                 elif strategy_type == "Bull Put Spread":
+                    # Buy Low Put, Sell High Put (Credit)
                     leg_a = find_closest_strike(puts, price_1)
                     leg_b = find_closest_strike(puts, price_2)
                     
@@ -568,13 +591,14 @@ def fetch_and_analyze_ticker_hybrid_v12(ticker, strategy_type, region="USA", sou
                     buy_strike, sell_strike = buy_leg['strike'], sell_leg['strike']
                     buy_prem, sell_prem = get_price(buy_leg, 'ask'), get_price(sell_leg, 'bid')
                     
-                    net_cost = buy_prem - sell_prem
+                    net_cost = buy_prem - sell_prem # Credit
                     max_gain = abs(net_cost)
                     margin = (sell_strike - buy_strike)
                     breakeven = sell_strike - max_gain
                     if margin > 0: ret_pct = (max_gain / margin) * 100
 
                 elif strategy_type == "Bear Put Spread":
+                    # Sell Low Put, Buy High Put (Debit)
                     leg_a = find_closest_strike(puts, price_1)
                     leg_b = find_closest_strike(puts, price_2)
                     
@@ -587,12 +611,13 @@ def fetch_and_analyze_ticker_hybrid_v12(ticker, strategy_type, region="USA", sou
                     buy_prem, sell_prem = get_price(buy_leg, 'ask'), get_price(sell_leg, 'bid')
                     
                     if buy_prem == 0: continue
-                    net_cost = buy_prem - sell_prem
+                    net_cost = buy_prem - sell_prem # Debit
                     max_gain = buy_strike - sell_strike
                     breakeven = buy_strike - net_cost
                     margin = net_cost
                     if net_cost > 0: ret_pct = ((max_gain - net_cost) / net_cost) * 100
                     
+                # -- COMMON OUTPUT --
                 if strategy_type != "Long Straddle":
                     cost_cmp_pct = 0.0
                     if margin > 0 and current_price > 0:
@@ -614,6 +639,7 @@ def fetch_and_analyze_ticker_hybrid_v12(ticker, strategy_type, region="USA", sou
                     })
                     summary_returns[date_str] = f"{ret_pct:.1f}%"
                 
+                # STRADDLE Logic preserved
                 elif strategy_type == "Long Straddle":
                     common = set(calls['strike']).intersection(set(puts['strike']))
                     if not common: continue
@@ -644,14 +670,25 @@ def fetch_and_analyze_ticker_hybrid_v12(ticker, strategy_type, region="USA", sou
 
         if not analysis_rows: return None, None, "Could not build strategies."
         
+        # Convert to DataFrame
         df = pd.DataFrame(analysis_rows)
         
+        # Data Cleaning: Force Numeric Types
         if not df.empty:
             cols_to_numeric = ["Spot Price", "Lot Size", "Buy Strike", "Buy Premium", "Sell Strike", "Sell Premium", "Net Cost", "Max Gain", "Breakeven", "Return %", "Cost/CMP %", "Strike", "Call Cost", "Put Cost", "BE Low", "BE High", "Move Needed", "Margin Required"]
             for col in cols_to_numeric:
                 if col in df.columns:
+                    # Coerce errors to NaN, then fill with 0.0. 
+                    # Also replace infinite values if any logic caused division by zero.
                     df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
                     df[col] = df[col].replace([float('inf'), float('-inf')], 0.0)
+        
+        # Reorder columns for visibility
+        if not df.empty and strategy_type != "Long Straddle":
+             cols = ["Expiration", "Spot Price", "Cost/CMP %", "Return %", "Net Cost", "Max Gain", "Buy Strike", "Sell Strike", "Buy Premium", "Sell Premium", "Breakeven", "Lot Size"]
+             # Keep only cols that exist
+             cols = [c for c in cols if c in df.columns]
+             df = df[cols]
 
         return summary_returns, df, None
 
@@ -695,6 +732,7 @@ def calculate_strategy_metrics(legs, current_price, view, lot_size=1, adapter=No
         if api_margin > 0: capital_required = api_margin
     
     if capital_required == 0:
+        # Fallback logic
         total_premium_lot = net_premium * lot_size
         puts = sorted([l for l in legs if l['type'] == 'Put'], key=lambda x: x['row']['strike'])
         calls = sorted([l for l in legs if l['type'] == 'Call'], key=lambda x: x['row']['strike'])
@@ -726,11 +764,7 @@ def analyze_custom_strategy(ticker, view, slab1_pct, slab2_pct, days_window, reg
         if region == "India":
             clean_ticker = ticker.replace(".NS", "")
             current_price = adapter.get_spot_price(clean_ticker)
-            if adapter:
-                if hasattr(adapter, 'get_lot_size'): lot_size = adapter.get_lot_size(clean_ticker)
-                else: 
-                     lots = get_nse_lot_sizes()
-                     lot_size = lots.get(clean_ticker, 1)
+            if source == "Zerodha (API)": lot_size = adapter.get_lot_size(clean_ticker)
             try:
                 stock = yf.Ticker(f"{clean_ticker}.NS")
                 earnings_date = get_next_earnings_date(stock)
@@ -970,7 +1004,7 @@ def main():
                 with st.spinner(f"Fetching data..."):
                     for i, ticker in enumerate(tickers):
                         # Renamed function call to bust cache and force fresh data fetch
-                        summary, df, error = fetch_and_analyze_ticker_hybrid_v12(ticker, strategy, region_key, source, z_api, z_token, pct_2, pct_1, expiry_idx)
+                        summary, df, error = fetch_and_analyze_ticker_hybrid_v13(ticker, strategy, region_key, source, z_api, z_token, pct_2, pct_1, expiry_idx)
                         if error: errors.append(f"{ticker}: {error}")
                         else:
                             all_summaries.append(summary)
@@ -995,7 +1029,6 @@ def main():
                             format_dict = {
                                 "Spot Price": "${:,.2f}", "Buy Premium": "${:,.2f}", "Sell Premium": "${:,.2f}",
                                 "Net Cost": "${:,.2f}", "Cost/CMP %": "{:.2f}%", "Max Gain": "${:,.2f}",
-                                "Margin Required": "${:,.0f}",
                                 "Breakeven": "${:,.2f}", "Return %": "{:.1f}%"
                             }
                         else:
@@ -1022,7 +1055,6 @@ def main():
                                 format_dict = {
                                     "Spot Price": "${:,.2f}", "Buy Premium": "${:,.2f}", "Sell Premium": "${:,.2f}",
                                     "Net Cost": "${:,.2f}", "Cost/CMP %": "{:.2f}%", "Max Gain": "${:,.2f}",
-                                    "Margin Required": "${:,.0f}",
                                     "Breakeven": "${:,.2f}", "Return %": "{:.1f}%"
                                 }
                             else:
