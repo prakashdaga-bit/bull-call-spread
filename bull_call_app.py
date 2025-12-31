@@ -493,7 +493,7 @@ def get_option_chain_with_retry(stock, date, retries=3):
 # ==========================================
 
 @st.cache_data(ttl=600, show_spinner=False)
-def fetch_and_analyze_ticker_hybrid_v11(ticker, strategy_type, region="USA", source="Yahoo", z_api=None, z_token=None, pct_1=0.0, pct_2=5.0, expiry_idx=0):
+def fetch_and_analyze_ticker_hybrid_v12(ticker, strategy_type, region="USA", source="Yahoo", z_api=None, z_token=None, pct_1=0.0, pct_2=5.0, expiry_idx=0):
     """Handles logic for USA (Yahoo) and India (NSE Scraper OR Zerodha)."""
     
     # 1. Setup Adapter
@@ -978,15 +978,24 @@ def main():
         source = st.sidebar.radio("India Data Source", ["NSE Website (Free/Flaky)", "Zerodha (API)"])
         if source == "Zerodha (API)":
             st.sidebar.info("Requires Kite Connect subscription.")
-            z_api = st.sidebar.text_input("API Key", value=saved_api if saved_api else "", type="password")
-            z_token = st.sidebar.text_input("Access Token", value=saved_token if saved_token else "", type="password")
-        
+            if saved_api and saved_api != st.session_state.get("z_api_input", ""):
+                 st.session_state["z_api_input"] = saved_api
+            if saved_token and saved_token != st.session_state.get("z_token_input", ""):
+                 st.session_state["z_token_input"] = saved_token
+            
+            z_api = st.sidebar.text_input("API Key", key="z_api_input", type="password")
+            z_token = st.sidebar.text_input("Access Token", key="z_token_input", type="password")
+            
+            if st.sidebar.button("Force Reload Token File"):
+                st.cache_data.clear()
+                st.rerun()
+
         # Check token file age
         file_dt = get_token_file_info()
         if file_dt:
              hours_old = (datetime.datetime.now() - file_dt).total_seconds() / 3600
              if hours_old > 12:
-                 st.sidebar.warning(f"⚠️ Token file is {hours_old:.1f} hours old. Auto-login might have failed.")
+                 st.sidebar.warning(f"⚠️ Token file is {hours_old:.1f} hours old.")
              else:
                  st.sidebar.success(f"✅ Token updated: {file_dt.strftime('%H:%M')}")
     
@@ -1015,7 +1024,8 @@ def main():
             c_exp, _ = st.columns([1,3])
             exp_opts = ["Current Month", "Next Month", "Far Month"]
             exp_sel = c_exp.selectbox("Select Expiry (India Only)", exp_opts)
-            expiry_idx = exp_opts.index(exp_sel)
+            try: expiry_idx = exp_opts.index(exp_sel)
+            except: expiry_idx = 0
         
         if strategy != "Long Straddle":
             c1, c2 = st.columns(2)
@@ -1043,12 +1053,11 @@ def main():
                 with st.spinner(f"Fetching data..."):
                     for i, ticker in enumerate(tickers):
                         # Renamed function call to bust cache and force fresh data fetch
-                        summary, df, error = fetch_and_analyze_ticker_hybrid_v11(ticker, strategy, region_key, source, z_api, z_token, pct_2, pct_1, expiry_idx)
+                        summary, df, error = fetch_and_analyze_ticker_hybrid_v12(ticker, strategy, region_key, source, z_api, z_token, pct_2, pct_1, expiry_idx)
                         if error: errors.append(f"{ticker}: {error}")
                         else:
                             all_summaries.append(summary)
                             
-                            # Clean numeric columns to avoid string formatting crash
                             all_details[ticker] = df
                             if not df.empty:
                                 df_summary = df.copy()
