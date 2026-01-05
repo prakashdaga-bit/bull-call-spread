@@ -75,7 +75,7 @@ def get_ticker_presets(region="USA"):
 
         # Filter for NSE segment and Futures (only F&O stocks have futures)
         fno_stocks = dfno[(dfno['exchange'] == 'NFO') & (dfno['instrument_type'] == 'FUT')]['name'].unique().tolist()
-        fo_list = ", ".join(sorted(lots.keys())) if lots else "RELIANCE, TCS, HDFCBANK, ICICIBANK, INFY, ITC, SBIN, BHARTIARTL, HINDUNILVR, LTIM"
+        fo_list = ", ".join(sorted(lots.keys())) if lots else "RELIANCE, TCS, HDFCBANK, ICICIBANK, INFY, ITC, SBIN, BHARTIARTL, HINDUNILVR"
         
         presets.update({
             "NIFTY 50 Top 10": "RELIANCE, TCS, HDFCBANK, ICICIBANK, INFY, ITC, SBIN, BHARTIARTL, HINDUNILVR, LTIM",
