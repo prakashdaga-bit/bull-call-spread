@@ -70,18 +70,14 @@ def get_ticker_presets(region="USA"):
     else:
         # Fetch NSE list for keys
         lots = get_nse_lot_sizes()
-        url = "https://api.kite.trade/instruments"
-        dfno = pd.read_csv(url)
-
         # Filter for NSE segment and Futures (only F&O stocks have futures)
-        fno_stocks = dfno[(dfno['exchange'] == 'NFO') & (dfno['instrument_type'] == 'FUT')]['name'].unique().tolist()
         fo_list = ", ".join(sorted(lots.keys())) if lots else "RELIANCE, TCS, HDFCBANK, ICICIBANK, INFY, ITC, SBIN, BHARTIARTL, HINDUNILVR"
         
         presets.update({
             "NIFTY 50 Top 10": "RELIANCE, TCS, HDFCBANK, ICICIBANK, INFY, ITC, SBIN, BHARTIARTL, HINDUNILVR, LTIM",
             "Indices": "NIFTY, BANKNIFTY, FINNIFTY",
             "Auto Sector": "TATAMOTORS, M&M, MARUTI, BAJAJ-AUTO, HEROMOTOCO, EICHERMOT",
-            "All F&O Stocks": fno_stocks
+            "All F&O Stocks": fo_list
         })
     return presets
 
