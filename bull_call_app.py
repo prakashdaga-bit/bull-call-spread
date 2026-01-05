@@ -9,7 +9,6 @@ import requests
 import os
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Union
-from io import StringIO
 
 # ==========================================
 # GLOBAL CONFIGURATION
@@ -17,45 +16,27 @@ from io import StringIO
 st.set_page_config(page_title="Options Strategy Master", page_icon="📈", layout="wide")
 
 # ==========================================
-# NSE HELPERS (LOT SIZES)
+# TICKER PRESETS
 # ==========================================
 @st.cache_data(ttl=86400) # Cache for 1 day
-def get_nse_lot_sizes():
-    """Fetches dictionary of {Symbol: LotSize} from NSE."""
+def get_nse_fo_stocks():
+    """Fetches list of F&O stocks from NSE."""
     try:
         url = "https://nsearchives.nseindia.com/content/fo/fo_mktlots.csv"
+        # Mimic browser to avoid 403
         headers = {'User-Agent': 'Mozilla/5.0'}
         response = requests.get(url, headers=headers)
         if response.status_code == 200:
-            # Clean text to handle potential bad formatting
-            csv_data = response.text.replace('\r', '')
-            df = pd.read_csv(StringIO(csv_data))
+            from io import StringIO
+            df = pd.read_csv(StringIO(response.text))
             df.columns = [c.strip().upper() for c in df.columns]
-            
-            # Look for SYMBOL and the column containing LOT size (usually matches 'LOT')
-            lot_col = next((c for c in df.columns if "LOT" in c), None)
-            sym_col = next((c for c in df.columns if "SYMBOL" in c), None)
-            
-            if lot_col and sym_col:
-                # Create a cleaned dictionary
-                # Remove rows where Symbol is missing or Lot is not a number
-                df = df.dropna(subset=[sym_col, lot_col])
-                
-                # Helper to clean lot strings (remove commas, spaces)
-                def clean_lot(val):
-                    try:
-                        return int(str(val).replace(',', '').strip())
-                    except:
-                        return 1
-                        
-                return dict(zip(df[sym_col].str.strip(), df[lot_col].apply(clean_lot)))
+            if 'SYMBOL' in df.columns:
+                symbols = [x.strip() for x in df['SYMBOL'].astype(str).unique() if x.strip().upper() not in ["SYMBOL", "NAN"]]
+                return ", ".join(sorted(symbols))
     except:
         pass
-    return {}
+    return "RELIANCE, TCS, HDFCBANK, ICICIBANK, INFY, ITC, SBIN, BHARTIARTL, HINDUNILVR, LTIM, TATAMOTORS, M&M, MARUTI, BAJAJ-AUTO"
 
-# ==========================================
-# TICKER PRESETS
-# ==========================================
 def get_ticker_presets(region="USA"):
     presets = {
         "Custom / Manual Input": ""
@@ -68,11 +49,7 @@ def get_ticker_presets(region="USA"):
             "NASDAQ 100 (Top 25)": "AAPL, MSFT, NVDA, AMZN, GOOGL, META, AVGO, TSLA, GOOG, COST, AMD, NFLX, PEP, ADBE, LIN, CSCO, TMUS, QCOM, INTC, AMGN, INTU, TXN, CMCSA, AMAT, HON"
         })
     else:
-        # Fetch NSE list for keys
-        lots = get_nse_lot_sizes()
-        # Filter for NSE segment and Futures (only F&O stocks have futures)
-        fo_list = ", ".join(sorted(lots.keys())) if lots else "RELIANCE, TCS, HDFCBANK, ICICIBANK, INFY, ITC, SBIN, BHARTIARTL, HINDUNILVR"
-        
+        fo_list = get_nse_fo_stocks()
         presets.update({
             "NIFTY 50 Top 10": "RELIANCE, TCS, HDFCBANK, ICICIBANK, INFY, ITC, SBIN, BHARTIARTL, HINDUNILVR, LTIM",
             "Indices": "NIFTY, BANKNIFTY, FINNIFTY",
@@ -120,12 +97,9 @@ class NSEMarketAdapter:
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "*/*",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
             "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Connection": "keep-alive",
-            "Referer": "https://www.nseindia.com/option-chain"
+            "Accept-Encoding": "gzip, deflate, br"
         })
         try:
             self.session.get(self.BASE_URL, timeout=5)
@@ -146,18 +120,9 @@ class NSEMarketAdapter:
                 if not hist.empty: price = hist['Close'].iloc[-1]
             return float(price) if price is not None else None
         except: return None
-        
-    def get_lot_size(self, ticker):
-        """Fetches lot size from NSE Archives."""
-        lots = get_nse_lot_sizes()
-        return lots.get(ticker, 1)
 
     def fetch_option_chain_raw(self, ticker):
-        if ticker in self.INDICES:
-            url = f"https://www.nseindia.com/api/option-chain-indices?symbol={ticker}"
-        else:
-            url = f"https://www.nseindia.com/api/option-chain-equities?symbol={ticker.upper()}"
-            
+        url = f"https://www.nseindia.com/api/option-chain-indices?symbol={ticker}" if ticker in self.INDICES else f"https://www.nseindia.com/api/option-chain-equities?symbol={ticker}"
         try:
             response = self.session.get(url, timeout=10)
             if response.status_code == 401:
@@ -208,6 +173,7 @@ class NSEMarketAdapter:
 class ZerodhaMarketAdapter:
     """
     Uses Kite Connect API to fetch option chains.
+    Requires 'kiteconnect' package: pip install kiteconnect
     """
     def __init__(self, api_key, access_token):
         self.api_key = api_key.strip()
@@ -228,11 +194,14 @@ class ZerodhaMarketAdapter:
             st.error(f"Zerodha Connection Error: {e}")
             return False
 
-    @st.cache_data(ttl=3600)
+    @st.cache_data(ttl=3600) # Cache instruments for 1 hour
     def get_instruments(_self):
         return pd.DataFrame(_self.kite.instruments("NFO"))
 
     def get_spot_price(self, ticker):
+        # Fallback to Yahoo for Spot price to save API calls or complex logic
+        # Or fetch from NSE equity if needed. Using Yahoo for simplicity as it's free.
+        # Mapping for indices
         idx_map = {"NIFTY": "^NSEI", "BANKNIFTY": "^NSEBANK", "FINNIFTY": "NIFTY_FIN_SERVICE.NS"}
         yf_ticker = idx_map.get(ticker, f"{ticker}.NS")
         try:
@@ -246,6 +215,8 @@ class ZerodhaMarketAdapter:
             self.instruments = self.get_instruments()
             
         df = self.instruments
+        
+        # Handle Indices vs Stocks
         name = ticker
         if ticker == "NIFTY": name = "NIFTY"
         elif ticker == "BANKNIFTY": name = "BANKNIFTY"
@@ -254,17 +225,23 @@ class ZerodhaMarketAdapter:
         subset = df[df['name'] == name].copy()
         if subset.empty: return [], {}
         
+        # Parse Expiry
         subset['expiry'] = pd.to_datetime(subset['expiry']).dt.date
         today = datetime.date.today()
         limit = today + datetime.timedelta(days=days_limit)
         
         valid_subset = subset[(subset['expiry'] >= today) & (subset['expiry'] <= limit)]
         unique_dates = sorted(valid_subset['expiry'].unique())
+        
+        # Limit to 3
         unique_dates = unique_dates[:3]
         
         return unique_dates, valid_subset
 
     def fetch_quotes(self, instrument_tokens):
+        # Zerodha allows multi-quote. 
+        # Batches of 500? Check documentation. 
+        # For simplicity, passing list directly.
         try:
             quotes = {}
             chunk_size = 500
@@ -275,52 +252,85 @@ class ZerodhaMarketAdapter:
                 time.sleep(0.1)
             return quotes
         except Exception as e:
+            st.error(f"Quote Fetch Error: {e}")
             return {}
 
     def get_lot_size(self, ticker):
         if self.instruments is None:
             self.instruments = self.get_instruments()
+        # Find first matching record
         name = ticker
         if ticker == "NIFTY": name = "NIFTY"
         elif ticker == "BANKNIFTY": name = "BANKNIFTY"
+        
         subset = self.instruments[self.instruments['name'] == name]
         if not subset.empty:
             return int(subset.iloc[0]['lot_size'])
         return 1
 
     def get_margin_for_basket(self, legs, lot_size=1):
+        """
+        Uses Kite Connect Order Margin API to get SPAN + Exposure margin.
+        legs: list of dicts with keys: 'row' (contains tradingsymbol), 'action' ('Buy'/'Sell'), 'type' ('Call'/'Put')
+        """
         if not self.kite: return 0.0
+        
         orders = []
         for leg in legs:
-            token = leg['row'].get('instrument_token')
+            # Need tradingsymbol from cached instruments
+            token = leg['row'].get('instrument_token') # We stored this in parse_chain for Zerodha
+            
+            # Find tradingsymbol from instruments df
             if self.instruments is not None and token:
                 row = self.instruments[self.instruments['instrument_token'] == token]
                 if not row.empty:
                     ts = row.iloc[0]['tradingsymbol']
                     txn_type = self.kite.TRANSACTION_TYPE_BUY if leg['action'] == "Buy" else self.kite.TRANSACTION_TYPE_SELL
+                    
                     orders.append({
-                        "exchange": "NFO", "tradingsymbol": ts, "transaction_type": txn_type,
-                        "variety": "regular", "product": "NRML", "order_type": "MARKET", "quantity": lot_size
+                        "exchange": "NFO",
+                        "tradingsymbol": ts,
+                        "transaction_type": txn_type,
+                        "variety": "regular",
+                        "product": "NRML",
+                        "order_type": "MARKET",
+                        "quantity": lot_size
                     })
+        
         if not orders: return 0.0
+        
         try:
+            # basket_margin returns detailed breakdown
             response = self.kite.basket_order_margins(orders)
+            # We want 'total' margin required for the final portfolio
+            # basket_order_margins returns details about initial and final margin
+            # We typically look at 'final' keys or initial depending on what user needs to place.
+            # Usually 'initial' margin is what blocks funds.
             if response and 'initial' in response:
                 return response['initial'].get('total', 0.0)
             return 0.0
-        except: return 0.0
+        except Exception as e:
+            # st.error(f"Margin Calc Error: {e}")
+            return 0.0
 
     def parse_chain(self, valid_instruments, expiry_date):
+        # Filter for specific expiry
         expiry_subset = valid_instruments[valid_instruments['expiry'] == expiry_date]
+        
         if expiry_subset.empty: return pd.DataFrame(), pd.DataFrame()
         
+        # Get Tokens
         tokens = expiry_subset['instrument_token'].tolist()
+        
+        # Fetch Quotes
         quotes = self.fetch_quotes(tokens)
         
-        calls_list, puts_list = [], []
+        calls_list = []
+        puts_list = []
         
         for _, row in expiry_subset.iterrows():
             token = row['instrument_token']
+            # ROBUST CHECK: Try both int and string key lookup
             q = quotes.get(token) or quotes.get(str(token))
             
             if not q: continue
@@ -329,16 +339,20 @@ class ZerodhaMarketAdapter:
             buy = depth.get('buy', [{}])[0]
             sell = depth.get('sell', [{}])[0]
             
+            # FORCE FLOATS
             data = {
                 'strike': float(row['strike']),
                 'lastPrice': float(q.get('last_price', 0.0)),
                 'bid': float(buy.get('price', 0.0)),
                 'ask': float(sell.get('price', 0.0)),
                 'openInterest': float(q.get('oi', 0.0)),
-                'instrument_token': token
+                'instrument_token': token # Store for margin calc
             }
-            if row['instrument_type'] == 'CE': calls_list.append(data)
-            elif row['instrument_type'] == 'PE': puts_list.append(data)
+            
+            if row['instrument_type'] == 'CE':
+                calls_list.append(data)
+            elif row['instrument_type'] == 'PE':
+                puts_list.append(data)
                 
         return pd.DataFrame(calls_list), pd.DataFrame(puts_list)
 
@@ -347,52 +361,88 @@ class ZerodhaMarketAdapter:
 # ==========================================
 
 def get_monthly_expirations(ticker_obj, limit=3):
+    """
+    Filters the list of expiration dates to find the next 'limit' distinct months.
+    Used for Simple Analysis (USA).
+    """
     try:
         expirations = ticker_obj.options
-        if not expirations: return []
+        if not expirations:
+            return []
+
+        # Convert strings to datetime objects
         dates = [datetime.datetime.strptime(date, '%Y-%m-%d') for date in expirations]
-        unique_months, seen_months = [], set()
+        
+        unique_months = []
+        seen_months = set()
+        
         for date in dates:
             month_key = (date.year, date.month)
             if month_key not in seen_months:
                 unique_months.append(date.strftime('%Y-%m-%d'))
                 seen_months.add(month_key)
-            if len(unique_months) >= limit: break
+            
+            if len(unique_months) >= limit:
+                break
+                
         return unique_months
-    except: return []
+    except:
+        return []
 
 def get_expirations_within_days(ticker_obj, days_limit=30):
+    """Returns all expiration dates within the next X days."""
     try:
         expirations = ticker_obj.options
-    except: return []
-    if not expirations: return []
+    except:
+        return []
+        
+    if not expirations:
+        return []
+        
     valid_dates = []
     today = datetime.date.today()
     limit_date = today + datetime.timedelta(days=days_limit)
+    
     for date_str in expirations:
         try:
             exp_date = datetime.datetime.strptime(date_str, '%Y-%m-%d').date()
-            if today <= exp_date <= limit_date: valid_dates.append(date_str)
-        except: continue
+            if today <= exp_date <= limit_date:
+                valid_dates.append(date_str)
+        except:
+            continue
+            
     return valid_dates
 
 def get_next_earnings_date(ticker_obj):
+    """Fetches the next earnings date."""
     try:
+        # Try retrieving calendar
         cal = ticker_obj.calendar
         if cal is not None and not isinstance(cal, list) and bool(cal):
+            # yfinance calendar structure varies; typically 'Earnings Date' row or column
+            # Check if dict-like or dataframe
             if isinstance(cal, dict) and 'Earnings Date' in cal:
                 dates = cal['Earnings Date']
-                if dates: return dates[0].strftime('%Y-%m-%d')
+                if dates:
+                    return dates[0].strftime('%Y-%m-%d')
             elif isinstance(cal, pd.DataFrame):
+                # Try finding row 'Earnings Date'
                 if 'Earnings Date' in cal.index:
                     vals = cal.loc['Earnings Date']
-                    if hasattr(vals, 'iloc'): return vals.iloc[0].strftime('%Y-%m-%d')
+                    # vals might be a Series or list
+                    if hasattr(vals, 'iloc'):
+                        return vals.iloc[0].strftime('%Y-%m-%d')
+        
+        # Fallback method: get_earnings_dates
         dates_df = ticker_obj.get_earnings_dates(limit=4)
         if dates_df is not None and len(dates_df) > 0:
             future_dates = dates_df[dates_df.index > pd.Timestamp.now()]
-            if not future_dates.empty: return future_dates.index[-1].strftime('%Y-%m-%d')
+            if not future_dates.empty:
+                return future_dates.index[-1].strftime('%Y-%m-%d') # Often sorted desc
+            
         return "N/A"
-    except: return "N/A"
+    except:
+        return "N/A"
 
 def filter_tradeable_options(chain):
     if chain.empty: return chain
@@ -412,15 +462,21 @@ def find_closest_strike(chain, price_target):
     return chain.sort_values('abs_diff').iloc[0]
 
 def get_price(option_row, price_type='mid'):
+    # Force float conversion to avoid string errors
     try:
         bid = float(option_row.get('bid', 0.0))
         ask = float(option_row.get('ask', 0.0))
         last = float(option_row.get('lastPrice', 0.0))
-    except: return 0.0
+    except:
+        return 0.0
     
-    if price_type == 'mid': return (bid + ask) / 2 if (bid > 0 and ask > 0) else last
-    elif price_type == 'ask': return ask if ask > 0 else last
-    elif price_type == 'bid': return bid if bid > 0 else (last * 0.95) 
+    if price_type == 'mid':
+        if bid > 0 and ask > 0: return (bid + ask) / 2
+        return last
+    elif price_type == 'ask':
+        return ask if ask > 0 else last
+    elif price_type == 'bid':
+        return bid if bid > 0 else (last * 0.95) 
     return last
 
 def get_option_chain_with_retry(stock, date, retries=3):
@@ -437,7 +493,7 @@ def get_option_chain_with_retry(stock, date, retries=3):
 # ==========================================
 
 @st.cache_data(ttl=600, show_spinner=False)
-def fetch_and_analyze_ticker_hybrid_v13(ticker, strategy_type, region="USA", source="Yahoo", z_api=None, z_token=None, pct_1=0.0, pct_2=5.0, expiry_idx=0):
+def fetch_and_analyze_ticker_hybrid_v15(ticker, strategy_type, region="USA", source="Yahoo", z_api=None, z_token=None, pct_1=0.0, pct_2=5.0, pct_3=0.0, expiry_idx=0):
     """Handles logic for USA (Yahoo) and India (NSE Scraper OR Zerodha)."""
     
     # 1. Setup Adapter
@@ -461,8 +517,8 @@ def fetch_and_analyze_ticker_hybrid_v13(ticker, strategy_type, region="USA", sou
                     lot_size = adapter.get_lot_size(clean_ticker)
                 else:
                     # Fallback for NSE Adapter
-                    lots = get_nse_lot_sizes()
-                    lot_size = lots.get(clean_ticker, 1)
+                    lots = get_nse_fo_stocks() # Wait, get_nse_lot_sizes? No, assuming 1 if not Zerodha
+                    lot_size = 1
         else:
             stock = yf.Ticker(ticker)
             try:
@@ -531,9 +587,9 @@ def fetch_and_analyze_ticker_hybrid_v13(ticker, strategy_type, region="USA", sou
             # 5. Run Simple Strategy Logic
             try:
                 # Common Vars
-                buy_leg, sell_leg = None, None
-                buy_strike, sell_strike = 0.0, 0.0
-                buy_prem, sell_prem = 0.0, 0.0
+                buy_leg, sell_leg, put_leg = None, None, None
+                buy_strike, sell_strike, put_strike = 0.0, 0.0, 0.0
+                buy_prem, sell_prem, put_prem = 0.0, 0.0, 0.0
                 net_cost, max_gain, breakeven, ret_pct, margin = 0.0, 0.0, 0.0, 0.0, 0.0
                 
                 # Targets
@@ -541,10 +597,8 @@ def fetch_and_analyze_ticker_hybrid_v13(ticker, strategy_type, region="USA", sou
                 price_2 = current_price * (1 + pct_2/100.0)
                 
                 if strategy_type == "Bull Call Spread":
-                    # Buy Low Call, Sell High Call (Debit)
                     leg_a = find_closest_strike(calls, price_1)
                     leg_b = find_closest_strike(calls, price_2)
-                    
                     if leg_a is None or leg_b is None or leg_a['strike'] == leg_b['strike']: continue
                     
                     buy_leg = leg_a if leg_a['strike'] < leg_b['strike'] else leg_b
@@ -561,10 +615,8 @@ def fetch_and_analyze_ticker_hybrid_v13(ticker, strategy_type, region="USA", sou
                     if net_cost > 0: ret_pct = ((max_gain - net_cost) / net_cost) * 100
 
                 elif strategy_type == "Bear Call Spread":
-                    # Sell Low Call, Buy High Call (Credit)
                     leg_a = find_closest_strike(calls, price_1)
                     leg_b = find_closest_strike(calls, price_2)
-                    
                     if leg_a is None or leg_b is None or leg_a['strike'] == leg_b['strike']: continue
                     
                     sell_leg = leg_a if leg_a['strike'] < leg_b['strike'] else leg_b
@@ -573,17 +625,15 @@ def fetch_and_analyze_ticker_hybrid_v13(ticker, strategy_type, region="USA", sou
                     buy_strike, sell_strike = buy_leg['strike'], sell_leg['strike']
                     buy_prem, sell_prem = get_price(buy_leg, 'ask'), get_price(sell_leg, 'bid')
                     
-                    net_cost = buy_prem - sell_prem # Credit
+                    net_cost = buy_prem - sell_prem 
                     max_gain = abs(net_cost)
                     margin = (buy_strike - sell_strike)
                     breakeven = sell_strike + max_gain
                     if margin > 0: ret_pct = (max_gain / margin) * 100
 
                 elif strategy_type == "Bull Put Spread":
-                    # Buy Low Put, Sell High Put (Credit)
                     leg_a = find_closest_strike(puts, price_1)
                     leg_b = find_closest_strike(puts, price_2)
-                    
                     if leg_a is None or leg_b is None or leg_a['strike'] == leg_b['strike']: continue
                     
                     buy_leg = leg_a if leg_a['strike'] < leg_b['strike'] else leg_b
@@ -592,17 +642,15 @@ def fetch_and_analyze_ticker_hybrid_v13(ticker, strategy_type, region="USA", sou
                     buy_strike, sell_strike = buy_leg['strike'], sell_leg['strike']
                     buy_prem, sell_prem = get_price(buy_leg, 'ask'), get_price(sell_leg, 'bid')
                     
-                    net_cost = buy_prem - sell_prem # Credit
+                    net_cost = buy_prem - sell_prem 
                     max_gain = abs(net_cost)
                     margin = (sell_strike - buy_strike)
                     breakeven = sell_strike - max_gain
                     if margin > 0: ret_pct = (max_gain / margin) * 100
 
                 elif strategy_type == "Bear Put Spread":
-                    # Sell Low Put, Buy High Put (Debit)
                     leg_a = find_closest_strike(puts, price_1)
                     leg_b = find_closest_strike(puts, price_2)
-                    
                     if leg_a is None or leg_b is None or leg_a['strike'] == leg_b['strike']: continue
                     
                     sell_leg = leg_a if leg_a['strike'] < leg_b['strike'] else leg_b
@@ -612,35 +660,101 @@ def fetch_and_analyze_ticker_hybrid_v13(ticker, strategy_type, region="USA", sou
                     buy_prem, sell_prem = get_price(buy_leg, 'ask'), get_price(sell_leg, 'bid')
                     
                     if buy_prem == 0: continue
-                    net_cost = buy_prem - sell_prem # Debit
+                    net_cost = buy_prem - sell_prem 
                     max_gain = buy_strike - sell_strike
                     breakeven = buy_strike - net_cost
                     margin = net_cost
                     if net_cost > 0: ret_pct = ((max_gain - net_cost) / net_cost) * 100
+                
+                elif strategy_type == "Leveraged Bull Call Spread":
+                    # 3 Legs: Long Call (Strike 1), Short Call (Strike 2), Short Put (Strike 3)
+                    # pct_1 = Buy Call
+                    # pct_2 = Sell Call
+                    # pct_3 = Sell Put
+                    price_3 = current_price * (1 + pct_3/100.0)
                     
+                    # Call Legs (Bull Spread)
+                    leg_a = find_closest_strike(calls, price_1)
+                    leg_b = find_closest_strike(calls, price_2)
+                    # Put Leg (Naked Short)
+                    leg_c = find_closest_strike(puts, price_3)
+
+                    if leg_a is None or leg_b is None or leg_c is None: continue
+                    if leg_a['strike'] == leg_b['strike']: continue
+
+                    # Enforce Bull Call Structure
+                    buy_leg = leg_a if leg_a['strike'] < leg_b['strike'] else leg_b
+                    sell_leg = leg_b if leg_a['strike'] < leg_b['strike'] else leg_a
+                    put_leg = leg_c
+
+                    buy_strike, sell_strike = buy_leg['strike'], sell_leg['strike']
+                    put_strike = put_leg['strike']
+
+                    buy_prem, sell_prem = get_price(buy_leg, 'ask'), get_price(sell_leg, 'bid')
+                    put_prem = get_price(put_leg, 'bid') # Sell Put
+
+                    # Net Cost = (Buy Call - Sell Call) - Sell Put
+                    call_spread_cost = buy_prem - sell_prem
+                    net_cost = call_spread_cost - put_prem # If negative -> Credit
+                    
+                    # Margin: Need API or estimate
+                    margin = 0.0
+                    if adapter and hasattr(adapter, 'get_margin_for_basket'):
+                        legs = [
+                            {'row': buy_leg.to_dict(), 'action': 'Buy', 'type': 'Call'},
+                            {'row': sell_leg.to_dict(), 'action': 'Sell', 'type': 'Call'},
+                            {'row': put_leg.to_dict(), 'action': 'Sell', 'type': 'Put'}
+                        ]
+                        api_margin = adapter.get_margin_for_basket(legs, lot_size)
+                        if api_margin > 0: margin = api_margin
+                    
+                    if margin == 0: 
+                        # Fallback margin approx: Put Strike * 0.15 (15% of spot)
+                        margin = (put_strike * 0.15) * lot_size
+                        # Convert back to per share for consistent math
+                        margin = margin / lot_size 
+                        
+                    max_gain = (sell_strike - buy_strike) - net_cost
+                    breakeven = put_strike + net_cost if net_cost > 0 else put_strike - abs(net_cost)
+                    
+                    # ROI on Margin
+                    if margin > 0: ret_pct = (max_gain / margin) * 100
+
                 # -- COMMON OUTPUT --
                 if strategy_type != "Long Straddle":
                     cost_cmp_pct = 0.0
                     if margin > 0 and current_price > 0:
                         cost_cmp_pct = (margin / current_price) * 100
 
-                    analysis_rows.append({
+                    base_row = {
                         "Expiration": date_str, 
                         "Spot Price": float(current_price),
                         "Lot Size": lot_size,
-                        "Buy Strike": buy_strike, 
-                        "Buy Premium": buy_prem,
-                        "Sell Strike": sell_strike, 
-                        "Sell Premium": sell_prem, 
                         "Net Cost": net_cost,
                         "Cost/CMP %": cost_cmp_pct,
                         "Max Gain": max_gain, 
+                        "Margin Required": margin, # Per share margin here, will scale later
                         "Return %": ret_pct, 
                         "Breakeven": breakeven
-                    })
+                    }
+                    
+                    # Add leg specific columns
+                    if strategy_type == "Leveraged Bull Call Spread":
+                         base_row.update({
+                             "Buy Call Strike": buy_strike, "Buy Call Prem": buy_prem,
+                             "Sell Call Strike": sell_strike, "Sell Call Prem": sell_prem,
+                             "Sell Put Strike": put_strike, "Sell Put Prem": put_prem
+                         })
+                    else:
+                         base_row.update({
+                            "Buy Strike": buy_strike, "Buy Premium": buy_prem,
+                            "Sell Strike": sell_strike, "Sell Premium": sell_prem,
+                         })
+                         
+                    analysis_rows.append(base_row)
                     summary_returns[date_str] = f"{ret_pct:.1f}%"
                 
-                # STRADDLE Logic preserved
+                # STRADDLE Logic
                 elif strategy_type == "Long Straddle":
                     common = set(calls['strike']).intersection(set(puts['strike']))
                     if not common: continue
@@ -662,8 +776,7 @@ def fetch_and_analyze_ticker_hybrid_v13(ticker, strategy_type, region="USA", sou
                         "Expiration": date_str, "Spot Price": float(current_price), "Lot Size": lot_size,
                         "Strike": strike, "Call Cost": c_ask, "Put Cost": p_ask, "Net Cost": net_cost, 
                         "Cost/CMP %": cost_cmp_pct,
-                        "BE Low": strike - net_cost, "BE High": strike + net_cost, 
-                        "Move Needed": (net_cost / current_price) * 100
+                        "BE Low": strike - net_cost, "BE High": strike + net_cost, "Move Needed": (net_cost / current_price) * 100
                     })
                     summary_returns[date_str] = f"±{ (net_cost / current_price) * 100:.1f}%"
 
@@ -676,20 +789,11 @@ def fetch_and_analyze_ticker_hybrid_v13(ticker, strategy_type, region="USA", sou
         
         # Data Cleaning: Force Numeric Types
         if not df.empty:
-            cols_to_numeric = ["Spot Price", "Lot Size", "Buy Strike", "Buy Premium", "Sell Strike", "Sell Premium", "Net Cost", "Max Gain", "Breakeven", "Return %", "Cost/CMP %", "Strike", "Call Cost", "Put Cost", "BE Low", "BE High", "Move Needed", "Margin Required"]
+            cols_to_numeric = ["Spot Price", "Lot Size", "Buy Strike", "Buy Premium", "Buy Call Strike", "Buy Call Prem", "Sell Strike", "Sell Premium", "Sell Call Strike", "Sell Call Prem", "Sell Put Strike", "Sell Put Prem", "Net Cost", "Max Gain", "Breakeven", "Return %", "Cost/CMP %", "Strike", "Call Cost", "Put Cost", "BE Low", "BE High", "Move Needed", "Margin Required"]
             for col in cols_to_numeric:
                 if col in df.columns:
-                    # Coerce errors to NaN, then fill with 0.0. 
-                    # Also replace infinite values if any logic caused division by zero.
                     df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
                     df[col] = df[col].replace([float('inf'), float('-inf')], 0.0)
-        
-        # Reorder columns for visibility
-        if not df.empty and strategy_type != "Long Straddle":
-             cols = ["Expiration", "Spot Price", "Cost/CMP %", "Return %", "Net Cost", "Max Gain", "Buy Strike", "Sell Strike", "Buy Premium", "Sell Premium", "Breakeven", "Lot Size"]
-             # Keep only cols that exist
-             cols = [c for c in cols if c in df.columns]
-             df = df[cols]
 
         return summary_returns, df, None
 
@@ -966,10 +1070,11 @@ def main():
     if mode == "Simple Analysis (Standard)":
         st.subheader(f"📈 {region_key} Market Real-Time Analysis")
         st.caption("Fetches live option chains. Standard Spreads/Straddles.")
-        strategy = st.radio("Strategy Type:", ("Bull Call Spread", "Bear Call Spread", "Bull Put Spread", "Bear Put Spread", "Long Straddle"), horizontal=True)
+        strategy = st.radio("Strategy Type:", ("Bull Call Spread", "Bear Call Spread", "Bull Put Spread", "Bear Put Spread", "Long Straddle", "Leveraged Bull Call Spread"), horizontal=True)
         
         pct_1 = 0.0
         pct_2 = 5.0
+        pct_3 = 0.0 # For leveraged
         expiry_idx = 0
         
         if region_key == "India":
@@ -980,9 +1085,12 @@ def main():
             except: expiry_idx = 0
         
         if strategy != "Long Straddle":
-            c1, c2 = st.columns(2)
+            c1, c2, c3 = st.columns(3)
             pct_1 = c1.number_input("Strike 1 (% from Spot)", min_value=-50.0, max_value=50.0, value=0.0, step=0.5)
             pct_2 = c2.number_input("Strike 2 (% from Spot)", min_value=-50.0, max_value=50.0, value=5.0, step=0.5)
+            
+            if strategy == "Leveraged Bull Call Spread":
+                pct_3 = c3.number_input("Sell Put Strike (% from Spot)", min_value=-50.0, max_value=0.0, value=0.0, step=0.5)
         
         def on_preset_simple_change():
             sel = st.session_state.preset_simple
@@ -1005,7 +1113,7 @@ def main():
                 with st.spinner(f"Fetching data..."):
                     for i, ticker in enumerate(tickers):
                         # Renamed function call to bust cache and force fresh data fetch
-                        summary, df, error = fetch_and_analyze_ticker_hybrid_v13(ticker, strategy, region_key, source, z_api, z_token, pct_2, pct_1, expiry_idx)
+                        summary, df, error = fetch_and_analyze_ticker_hybrid_v15(ticker, strategy, region_key, source, z_api, z_token, pct_1, pct_2, pct_3, expiry_idx)
                         if error: errors.append(f"{ticker}: {error}")
                         else:
                             all_summaries.append(summary)
@@ -1026,17 +1134,26 @@ def main():
                         st.subheader(f"Expiry: {exp}")
                         subset = full_df[full_df['Expiration'] == exp].drop(columns=['Expiration'])
                         
-                        if strategy != "Long Straddle":
-                            format_dict = {
-                                "Spot Price": "${:,.2f}", "Buy Premium": "${:,.2f}", "Sell Premium": "${:,.2f}",
-                                "Net Cost": "${:,.2f}", "Cost/CMP %": "{:.2f}%", "Max Gain": "${:,.2f}",
-                                "Breakeven": "${:,.2f}", "Return %": "{:.1f}%"
-                            }
-                        else:
+                        # Define Columns
+                        cols_to_show = []
+                        if strategy == "Long Straddle":
                             format_dict = {
                                 "Spot Price": "${:,.2f}", "Call Cost": "${:,.2f}", "Put Cost": "${:,.2f}",
                                 "Net Cost": "${:,.2f}", "Cost/CMP %": "{:.2f}%", "BE Low": "${:,.2f}",
                                 "BE High": "${:,.2f}", "Move Needed": "{:.1f}%"
+                            }
+                        elif strategy == "Leveraged Bull Call Spread":
+                             format_dict = {
+                                "Spot Price": "${:,.2f}", "Net Cost": "${:,.2f}", "Margin Required": "${:,.0f}",
+                                "Return %": "{:.1f}%", "Max Gain": "${:,.2f}", "Breakeven": "${:,.2f}",
+                                "Buy Call Strike": "${:,.2f}", "Sell Call Strike": "${:,.2f}", "Sell Put Strike": "${:,.2f}"
+                            }
+                        else:
+                            format_dict = {
+                                "Spot Price": "${:,.2f}", "Buy Premium": "${:,.2f}", "Sell Premium": "${:,.2f}",
+                                "Net Cost": "${:,.2f}", "Cost/CMP %": "{:.2f}%", "Max Gain": "${:,.2f}",
+                                "Margin Required": "${:,.0f}",
+                                "Breakeven": "${:,.2f}", "Return %": "{:.1f}%"
                             }
                         
                         # Use try/except block for display robustness
@@ -1052,25 +1169,12 @@ def main():
                     for ticker, df in all_details.items():
                         with st.expander(f"{ticker} Details", expanded=False):
                             
-                            if strategy != "Long Straddle":
-                                format_dict = {
-                                    "Spot Price": "${:,.2f}", "Buy Premium": "${:,.2f}", "Sell Premium": "${:,.2f}",
-                                    "Net Cost": "${:,.2f}", "Cost/CMP %": "{:.2f}%", "Max Gain": "${:,.2f}",
-                                    "Breakeven": "${:,.2f}", "Return %": "{:.1f}%"
-                                }
-                            else:
-                                format_dict = {
-                                    "Spot Price": "${:,.2f}", "Call Cost": "${:,.2f}", "Put Cost": "${:,.2f}",
-                                    "Net Cost": "${:,.2f}", "Cost/CMP %": "{:.2f}%", "BE Low": "${:,.2f}",
-                                    "BE High": "${:,.2f}", "Move Needed": "{:.1f}%"
-                                }
-                            
-                            if not df.empty:
-                                try:
-                                    st.dataframe(df.style.format(format_dict), use_container_width=True)
-                                except Exception as e:
-                                    st.error(f"⚠️ Formatting error. Showing raw data.")
-                                    st.dataframe(df, use_container_width=True)
+                            # Formatting reuse logic (same as summary for simplicity)
+                            try:
+                                st.dataframe(df.style.format(format_dict), use_container_width=True)
+                            except Exception as e:
+                                st.error(f"⚠️ Formatting error. Showing raw data.")
+                                st.dataframe(df, use_container_width=True)
                 if errors:
                     with st.expander("Errors"):
                         for e in errors: st.write(f"- {e}")
@@ -1118,8 +1222,7 @@ def main():
                                     "Margin (1 Lot)": f"${metrics['capital_required']:,.0f}",
                                     "Net Max Profit": f"${metrics['net_max_profit']:,.0f}",
                                     "ROI": f"{metrics['roi']:.1f}%",
-                                    "Est. Brokerage": f"${metrics['brokerage']:.2f}",
-                                    "Lot Size": metrics['lot_size']
+                                    "Est. Brokerage": f"${metrics['brokerage']:.2f}"
                                 }
                                 all_summaries.append(summary_data)
                         progress_bar.progress((i + 1) / len(tickers))
