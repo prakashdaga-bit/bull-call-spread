@@ -9,6 +9,7 @@ import requests
 import os
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Union
+from io import StringIO
 
 # ==========================================
 # GLOBAL CONFIGURATION
@@ -16,27 +17,30 @@ from typing import List, Optional, Dict, Union
 st.set_page_config(page_title="Options Strategy Master", page_icon="📈", layout="wide")
 
 # ==========================================
-# TICKER PRESETS
+# NSE HELPERS (LOT SIZES)
 # ==========================================
 @st.cache_data(ttl=86400) # Cache for 1 day
-def get_nse_fo_stocks():
-    """Fetches list of F&O stocks from NSE."""
+def get_fno_info_zerodha():
+    """
+    Fetches F&O stock list and Lot Sizes from Zerodha's public instrument dump.
+    Returns: Dictionary {Symbol: LotSize}
+    """
     try:
-        url = "https://nsearchives.nseindia.com/content/fo/fo_mktlots.csv"
-        # Mimic browser to avoid 403
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        response = requests.get(url, headers=headers)
-        if response.status_code == 200:
-            from io import StringIO
-            df = pd.read_csv(StringIO(response.text))
-            df.columns = [c.strip().upper() for c in df.columns]
-            if 'SYMBOL' in df.columns:
-                symbols = [x.strip() for x in df['SYMBOL'].astype(str).unique() if x.strip().upper() not in ["SYMBOL", "NAN"]]
-                return ", ".join(sorted(symbols))
-    except:
-        pass
-    return "RELIANCE, TCS, HDFCBANK, ICICIBANK, INFY, ITC, SBIN, BHARTIARTL, HINDUNILVR, LTIM, TATAMOTORS, M&M, MARUTI, BAJAJ-AUTO"
+        url = "https://api.kite.trade/instruments"
+        df = pd.read_csv(url)
+        fno_df = df[(df['exchange'] == 'NFO') & (df['instrument_type'] == 'FUT')]
+        unique_df = fno_df.drop_duplicates(subset=['name'])
+        result = dict(zip(unique_df['name'], unique_df['lot_size']))
+        return result
+    except Exception as e:
+        return {
+            "RELIANCE": 250, "TCS": 175, "HDFCBANK": 550, "INFY": 400,
+            "NIFTY": 75, "BANKNIFTY": 30
+        }
 
+# ==========================================
+# TICKER PRESETS
+# ==========================================
 def get_ticker_presets(region="USA"):
     presets = {
         "Custom / Manual Input": ""
@@ -49,7 +53,13 @@ def get_ticker_presets(region="USA"):
             "NASDAQ 100 (Top 25)": "AAPL, MSFT, NVDA, AMZN, GOOGL, META, AVGO, TSLA, GOOG, COST, AMD, NFLX, PEP, ADBE, LIN, CSCO, TMUS, QCOM, INTC, AMGN, INTU, TXN, CMCSA, AMAT, HON"
         })
     else:
-        fo_list = get_nse_fo_stocks()
+        # Fetch Zerodha list for keys
+        fno_data = get_fno_info_zerodha()
+        if fno_data:
+            fo_list = ", ".join(sorted(fno_data.keys()))
+        else:
+            fo_list = "RELIANCE, TCS, HDFCBANK, ICICIBANK, INFY, ITC, SBIN, BHARTIARTL, HINDUNILVR, LTIM"
+        
         presets.update({
             "NIFTY 50 Top 10": "RELIANCE, TCS, HDFCBANK, ICICIBANK, INFY, ITC, SBIN, BHARTIARTL, HINDUNILVR, LTIM",
             "Indices": "NIFTY, BANKNIFTY, FINNIFTY",
@@ -120,9 +130,18 @@ class NSEMarketAdapter:
                 if not hist.empty: price = hist['Close'].iloc[-1]
             return float(price) if price is not None else None
         except: return None
+        
+    def get_lot_size(self, ticker):
+        """Fetches lot size from Zerodha Public Dump."""
+        lots = get_fno_info_zerodha()
+        return int(lots.get(ticker, 1))
 
     def fetch_option_chain_raw(self, ticker):
-        url = f"https://www.nseindia.com/api/option-chain-indices?symbol={ticker}" if ticker in self.INDICES else f"https://www.nseindia.com/api/option-chain-equities?symbol={ticker}"
+        if ticker in self.INDICES:
+            url = f"https://www.nseindia.com/api/option-chain-indices?symbol={ticker}"
+        else:
+            url = f"https://www.nseindia.com/api/option-chain-equities?symbol={ticker.upper()}"
+            
         try:
             response = self.session.get(url, timeout=10)
             if response.status_code == 401:
@@ -142,8 +161,10 @@ class NSEMarketAdapter:
         for d_str in expiry_dates:
             try:
                 d = datetime.datetime.strptime(d_str, "%d-%b-%Y").date()
-                if today <= d <= limit: valid_dates.append(d_str)
-            except: continue
+                if today <= d <= limit:
+                    valid_dates.append(d_str)
+            except:
+                continue
         return valid_dates, data
 
     def parse_chain(self, raw_data, expiry_date_str):
@@ -199,9 +220,6 @@ class ZerodhaMarketAdapter:
         return pd.DataFrame(_self.kite.instruments("NFO"))
 
     def get_spot_price(self, ticker):
-        # Fallback to Yahoo for Spot price to save API calls or complex logic
-        # Or fetch from NSE equity if needed. Using Yahoo for simplicity as it's free.
-        # Mapping for indices
         idx_map = {"NIFTY": "^NSEI", "BANKNIFTY": "^NSEBANK", "FINNIFTY": "NIFTY_FIN_SERVICE.NS"}
         yf_ticker = idx_map.get(ticker, f"{ticker}.NS")
         try:
@@ -215,8 +233,6 @@ class ZerodhaMarketAdapter:
             self.instruments = self.get_instruments()
             
         df = self.instruments
-        
-        # Handle Indices vs Stocks
         name = ticker
         if ticker == "NIFTY": name = "NIFTY"
         elif ticker == "BANKNIFTY": name = "BANKNIFTY"
@@ -225,23 +241,17 @@ class ZerodhaMarketAdapter:
         subset = df[df['name'] == name].copy()
         if subset.empty: return [], {}
         
-        # Parse Expiry
         subset['expiry'] = pd.to_datetime(subset['expiry']).dt.date
         today = datetime.date.today()
         limit = today + datetime.timedelta(days=days_limit)
         
         valid_subset = subset[(subset['expiry'] >= today) & (subset['expiry'] <= limit)]
         unique_dates = sorted(valid_subset['expiry'].unique())
-        
-        # Limit to 3
         unique_dates = unique_dates[:3]
         
         return unique_dates, valid_subset
 
     def fetch_quotes(self, instrument_tokens):
-        # Zerodha allows multi-quote. 
-        # Batches of 500? Check documentation. 
-        # For simplicity, passing list directly.
         try:
             quotes = {}
             chunk_size = 500
@@ -258,79 +268,49 @@ class ZerodhaMarketAdapter:
     def get_lot_size(self, ticker):
         if self.instruments is None:
             self.instruments = self.get_instruments()
-        # Find first matching record
         name = ticker
         if ticker == "NIFTY": name = "NIFTY"
         elif ticker == "BANKNIFTY": name = "BANKNIFTY"
-        
         subset = self.instruments[self.instruments['name'] == name]
         if not subset.empty:
             return int(subset.iloc[0]['lot_size'])
-        return 1
+        # Fallback to public list
+        lots = get_fno_info_zerodha()
+        return int(lots.get(ticker, 1))
 
     def get_margin_for_basket(self, legs, lot_size=1):
-        """
-        Uses Kite Connect Order Margin API to get SPAN + Exposure margin.
-        legs: list of dicts with keys: 'row' (contains tradingsymbol), 'action' ('Buy'/'Sell'), 'type' ('Call'/'Put')
-        """
         if not self.kite: return 0.0
-        
         orders = []
         for leg in legs:
-            # Need tradingsymbol from cached instruments
-            token = leg['row'].get('instrument_token') # We stored this in parse_chain for Zerodha
-            
-            # Find tradingsymbol from instruments df
+            token = leg['row'].get('instrument_token')
             if self.instruments is not None and token:
                 row = self.instruments[self.instruments['instrument_token'] == token]
                 if not row.empty:
                     ts = row.iloc[0]['tradingsymbol']
                     txn_type = self.kite.TRANSACTION_TYPE_BUY if leg['action'] == "Buy" else self.kite.TRANSACTION_TYPE_SELL
-                    
                     orders.append({
-                        "exchange": "NFO",
-                        "tradingsymbol": ts,
-                        "transaction_type": txn_type,
-                        "variety": "regular",
-                        "product": "NRML",
-                        "order_type": "MARKET",
-                        "quantity": lot_size
+                        "exchange": "NFO", "tradingsymbol": ts, "transaction_type": txn_type,
+                        "variety": "regular", "product": "NRML", "order_type": "MARKET", "quantity": lot_size
                     })
-        
         if not orders: return 0.0
-        
         try:
-            # basket_margin returns detailed breakdown
             response = self.kite.basket_order_margins(orders)
-            # We want 'total' margin required for the final portfolio
-            # basket_order_margins returns details about initial and final margin
-            # We typically look at 'final' keys or initial depending on what user needs to place.
-            # Usually 'initial' margin is what blocks funds.
             if response and 'initial' in response:
                 return response['initial'].get('total', 0.0)
             return 0.0
-        except Exception as e:
-            # st.error(f"Margin Calc Error: {e}")
-            return 0.0
+        except: return 0.0
 
     def parse_chain(self, valid_instruments, expiry_date):
-        # Filter for specific expiry
         expiry_subset = valid_instruments[valid_instruments['expiry'] == expiry_date]
-        
         if expiry_subset.empty: return pd.DataFrame(), pd.DataFrame()
         
-        # Get Tokens
         tokens = expiry_subset['instrument_token'].tolist()
-        
-        # Fetch Quotes
         quotes = self.fetch_quotes(tokens)
         
-        calls_list = []
-        puts_list = []
+        calls_list, puts_list = [], []
         
         for _, row in expiry_subset.iterrows():
             token = row['instrument_token']
-            # ROBUST CHECK: Try both int and string key lookup
             q = quotes.get(token) or quotes.get(str(token))
             
             if not q: continue
@@ -339,20 +319,16 @@ class ZerodhaMarketAdapter:
             buy = depth.get('buy', [{}])[0]
             sell = depth.get('sell', [{}])[0]
             
-            # FORCE FLOATS
             data = {
                 'strike': float(row['strike']),
                 'lastPrice': float(q.get('last_price', 0.0)),
                 'bid': float(buy.get('price', 0.0)),
                 'ask': float(sell.get('price', 0.0)),
                 'openInterest': float(q.get('oi', 0.0)),
-                'instrument_token': token # Store for margin calc
+                'instrument_token': token
             }
-            
-            if row['instrument_type'] == 'CE':
-                calls_list.append(data)
-            elif row['instrument_type'] == 'PE':
-                puts_list.append(data)
+            if row['instrument_type'] == 'CE': calls_list.append(data)
+            elif row['instrument_type'] == 'PE': puts_list.append(data)
                 
         return pd.DataFrame(calls_list), pd.DataFrame(puts_list)
 
@@ -361,88 +337,52 @@ class ZerodhaMarketAdapter:
 # ==========================================
 
 def get_monthly_expirations(ticker_obj, limit=3):
-    """
-    Filters the list of expiration dates to find the next 'limit' distinct months.
-    Used for Simple Analysis (USA).
-    """
     try:
         expirations = ticker_obj.options
-        if not expirations:
-            return []
-
-        # Convert strings to datetime objects
+        if not expirations: return []
         dates = [datetime.datetime.strptime(date, '%Y-%m-%d') for date in expirations]
-        
-        unique_months = []
-        seen_months = set()
-        
+        unique_months, seen_months = [], set()
         for date in dates:
             month_key = (date.year, date.month)
             if month_key not in seen_months:
                 unique_months.append(date.strftime('%Y-%m-%d'))
                 seen_months.add(month_key)
-            
-            if len(unique_months) >= limit:
-                break
-                
+            if len(unique_months) >= limit: break
         return unique_months
-    except:
-        return []
+    except: return []
 
 def get_expirations_within_days(ticker_obj, days_limit=30):
-    """Returns all expiration dates within the next X days."""
     try:
         expirations = ticker_obj.options
-    except:
-        return []
-        
-    if not expirations:
-        return []
-        
+    except: return []
+    if not expirations: return []
     valid_dates = []
     today = datetime.date.today()
     limit_date = today + datetime.timedelta(days=days_limit)
-    
     for date_str in expirations:
         try:
             exp_date = datetime.datetime.strptime(date_str, '%Y-%m-%d').date()
-            if today <= exp_date <= limit_date:
-                valid_dates.append(date_str)
-        except:
-            continue
-            
+            if today <= exp_date <= limit_date: valid_dates.append(date_str)
+        except: continue
     return valid_dates
 
 def get_next_earnings_date(ticker_obj):
-    """Fetches the next earnings date."""
     try:
-        # Try retrieving calendar
         cal = ticker_obj.calendar
         if cal is not None and not isinstance(cal, list) and bool(cal):
-            # yfinance calendar structure varies; typically 'Earnings Date' row or column
-            # Check if dict-like or dataframe
             if isinstance(cal, dict) and 'Earnings Date' in cal:
                 dates = cal['Earnings Date']
-                if dates:
-                    return dates[0].strftime('%Y-%m-%d')
+                if dates: return dates[0].strftime('%Y-%m-%d')
             elif isinstance(cal, pd.DataFrame):
-                # Try finding row 'Earnings Date'
                 if 'Earnings Date' in cal.index:
                     vals = cal.loc['Earnings Date']
-                    # vals might be a Series or list
-                    if hasattr(vals, 'iloc'):
-                        return vals.iloc[0].strftime('%Y-%m-%d')
-        
-        # Fallback method: get_earnings_dates
+                    if hasattr(vals, 'iloc'): return vals.iloc[0].strftime('%Y-%m-%d')
         dates_df = ticker_obj.get_earnings_dates(limit=4)
         if dates_df is not None and len(dates_df) > 0:
             future_dates = dates_df[dates_df.index > pd.Timestamp.now()]
-            if not future_dates.empty:
-                return future_dates.index[-1].strftime('%Y-%m-%d') # Often sorted desc
-            
+            if not future_dates.empty: return future_dates.index[-1].strftime('%Y-%m-%d')
         return "N/A"
-    except:
-        return "N/A"
+    except: return "N/A"
 
 def filter_tradeable_options(chain):
     if chain.empty: return chain
@@ -462,21 +402,15 @@ def find_closest_strike(chain, price_target):
     return chain.sort_values('abs_diff').iloc[0]
 
 def get_price(option_row, price_type='mid'):
-    # Force float conversion to avoid string errors
     try:
         bid = float(option_row.get('bid', 0.0))
         ask = float(option_row.get('ask', 0.0))
         last = float(option_row.get('lastPrice', 0.0))
-    except:
-        return 0.0
+    except: return 0.0
     
-    if price_type == 'mid':
-        if bid > 0 and ask > 0: return (bid + ask) / 2
-        return last
-    elif price_type == 'ask':
-        return ask if ask > 0 else last
-    elif price_type == 'bid':
-        return bid if bid > 0 else (last * 0.95) 
+    if price_type == 'mid': return (bid + ask) / 2 if (bid > 0 and ask > 0) else last
+    elif price_type == 'ask': return ask if ask > 0 else last
+    elif price_type == 'bid': return bid if bid > 0 else (last * 0.95) 
     return last
 
 def get_option_chain_with_retry(stock, date, retries=3):
@@ -493,370 +427,7 @@ def get_option_chain_with_retry(stock, date, retries=3):
 # ==========================================
 
 @st.cache_data(ttl=600, show_spinner=False)
-def fetch_and_analyze_ticker_hybrid_v15(ticker, strategy_type, region="USA", source="Yahoo", z_api=None, z_token=None, pct_1=0.0, pct_2=5.0, pct_3=0.0, expiry_idx=0):
-    """Handles logic for USA (Yahoo) and India (NSE Scraper OR Zerodha)."""
-    
-    # 1. Setup Adapter
-    adapter = None
-    if region == "India":
-        if source == "Zerodha (API)":
-            adapter = ZerodhaMarketAdapter(z_api, z_token)
-            if not adapter.connect(): return None, None, "Zerodha Connection Failed"
-        else:
-            adapter = NSEMarketAdapter()
-    
-    try:
-        # 2. Get Spot Price
-        lot_size = 1
-        if region == "India":
-            # For NSE scraper, sometimes .NS is added, strip it
-            clean_ticker = ticker.replace(".NS", "")
-            current_price = adapter.get_spot_price(clean_ticker)
-            if adapter: # Zerodha or NSE
-                if hasattr(adapter, 'get_lot_size'):
-                    lot_size = adapter.get_lot_size(clean_ticker)
-                else:
-                    # Fallback for NSE Adapter
-                    lots = get_nse_fo_stocks() # Wait, get_nse_lot_sizes? No, assuming 1 if not Zerodha
-                    lot_size = 1
-        else:
-            stock = yf.Ticker(ticker)
-            try:
-                current_price = stock.fast_info['last_price']
-            except:
-                hist = stock.history(period='1d')
-                if not hist.empty: current_price = hist['Close'].iloc[-1]
-                else: current_price = None
-
-        if not current_price: return None, None, f"Could not fetch spot price for {ticker}"
-
-        # 3. Get Expirations
-        valid_dates = []
-        raw_data = None # For NSE scraper
-        valid_instruments = None # For Zerodha
-        
-        if region == "India":
-            if source == "Zerodha (API)":
-                valid_dates, valid_instruments = adapter.get_chain_for_symbol(clean_ticker)
-            else:
-                valid_dates, raw_data = adapter.get_expirations(clean_ticker, days_limit=90)
-                if valid_dates: valid_dates = valid_dates[:3] # Default max 3
-        else:
-            stock = yf.Ticker(ticker)
-            try:
-                # Use Monthly Logic for Simple Analysis
-                valid_dates = get_monthly_expirations(stock, limit=3)
-            except: pass
-
-        if not valid_dates: return None, None, "No valid expirations found."
-        
-        # --- EXPIRY FILTERING FOR INDIA ---
-        if region == "India" and valid_dates:
-            if expiry_idx < len(valid_dates):
-                valid_dates = [valid_dates[expiry_idx]]
-            else:
-                valid_dates = [valid_dates[-1]] # Fallback to furthest if index out of bounds
-
-        analysis_rows = []
-        summary_returns = {"Stock": ticker}
-
-        for date_obj in valid_dates:
-            # 4. Get Option Chain
-            calls, puts = pd.DataFrame(), pd.DataFrame()
-            
-            # Date Handling (Zerodha returns date objects, others strings)
-            if isinstance(date_obj, datetime.date): date_str = date_obj.strftime('%Y-%m-%d')
-            else: date_str = date_obj
-            
-            if region == "India":
-                if source == "Zerodha (API)":
-                    calls, puts = adapter.parse_chain(valid_instruments, date_obj) # Pass date object
-                else:
-                    calls, puts = adapter.parse_chain(raw_data, date_str)
-            else:
-                try:
-                    chain = stock.option_chain(date_str)
-                    calls, puts = chain.calls, chain.puts
-                except: continue
-
-            calls = filter_tradeable_options(calls)
-            puts = filter_tradeable_options(puts)
-            
-            if calls.empty or puts.empty: continue
-
-            # 5. Run Simple Strategy Logic
-            try:
-                # Common Vars
-                buy_leg, sell_leg, put_leg = None, None, None
-                buy_strike, sell_strike, put_strike = 0.0, 0.0, 0.0
-                buy_prem, sell_prem, put_prem = 0.0, 0.0, 0.0
-                net_cost, max_gain, breakeven, ret_pct, margin = 0.0, 0.0, 0.0, 0.0, 0.0
-                
-                # Targets
-                price_1 = current_price * (1 + pct_1/100.0)
-                price_2 = current_price * (1 + pct_2/100.0)
-                
-                if strategy_type == "Bull Call Spread":
-                    leg_a = find_closest_strike(calls, price_1)
-                    leg_b = find_closest_strike(calls, price_2)
-                    if leg_a is None or leg_b is None or leg_a['strike'] == leg_b['strike']: continue
-                    
-                    buy_leg = leg_a if leg_a['strike'] < leg_b['strike'] else leg_b
-                    sell_leg = leg_b if leg_a['strike'] < leg_b['strike'] else leg_a
-                    
-                    buy_strike, sell_strike = buy_leg['strike'], sell_leg['strike']
-                    buy_prem, sell_prem = get_price(buy_leg, 'ask'), get_price(sell_leg, 'bid')
-                    if buy_prem == 0: continue
-                    
-                    net_cost = buy_prem - sell_prem
-                    max_gain = sell_strike - buy_strike
-                    breakeven = buy_strike + net_cost
-                    margin = net_cost
-                    if net_cost > 0: ret_pct = ((max_gain - net_cost) / net_cost) * 100
-
-                elif strategy_type == "Bear Call Spread":
-                    leg_a = find_closest_strike(calls, price_1)
-                    leg_b = find_closest_strike(calls, price_2)
-                    if leg_a is None or leg_b is None or leg_a['strike'] == leg_b['strike']: continue
-                    
-                    sell_leg = leg_a if leg_a['strike'] < leg_b['strike'] else leg_b
-                    buy_leg = leg_b if leg_a['strike'] < leg_b['strike'] else leg_a
-                    
-                    buy_strike, sell_strike = buy_leg['strike'], sell_leg['strike']
-                    buy_prem, sell_prem = get_price(buy_leg, 'ask'), get_price(sell_leg, 'bid')
-                    
-                    net_cost = buy_prem - sell_prem 
-                    max_gain = abs(net_cost)
-                    margin = (buy_strike - sell_strike)
-                    breakeven = sell_strike + max_gain
-                    if margin > 0: ret_pct = (max_gain / margin) * 100
-
-                elif strategy_type == "Bull Put Spread":
-                    leg_a = find_closest_strike(puts, price_1)
-                    leg_b = find_closest_strike(puts, price_2)
-                    if leg_a is None or leg_b is None or leg_a['strike'] == leg_b['strike']: continue
-                    
-                    buy_leg = leg_a if leg_a['strike'] < leg_b['strike'] else leg_b
-                    sell_leg = leg_b if leg_a['strike'] < leg_b['strike'] else leg_a
-                    
-                    buy_strike, sell_strike = buy_leg['strike'], sell_leg['strike']
-                    buy_prem, sell_prem = get_price(buy_leg, 'ask'), get_price(sell_leg, 'bid')
-                    
-                    net_cost = buy_prem - sell_prem 
-                    max_gain = abs(net_cost)
-                    margin = (sell_strike - buy_strike)
-                    breakeven = sell_strike - max_gain
-                    if margin > 0: ret_pct = (max_gain / margin) * 100
-
-                elif strategy_type == "Bear Put Spread":
-                    leg_a = find_closest_strike(puts, price_1)
-                    leg_b = find_closest_strike(puts, price_2)
-                    if leg_a is None or leg_b is None or leg_a['strike'] == leg_b['strike']: continue
-                    
-                    sell_leg = leg_a if leg_a['strike'] < leg_b['strike'] else leg_b
-                    buy_leg = leg_b if leg_a['strike'] < leg_b['strike'] else leg_a
-                    
-                    buy_strike, sell_strike = buy_leg['strike'], sell_leg['strike']
-                    buy_prem, sell_prem = get_price(buy_leg, 'ask'), get_price(sell_leg, 'bid')
-                    
-                    if buy_prem == 0: continue
-                    net_cost = buy_prem - sell_prem 
-                    max_gain = buy_strike - sell_strike
-                    breakeven = buy_strike - net_cost
-                    margin = net_cost
-                    if net_cost > 0: ret_pct = ((max_gain - net_cost) / net_cost) * 100
-                
-                elif strategy_type == "Leveraged Bull Call Spread":
-                    # 3 Legs: Long Call (Strike 1), Short Call (Strike 2), Short Put (Strike 3)
-                    # pct_1 = Buy Call
-                    # pct_2 = Sell Call
-                    # pct_3 = Sell Put
-                    price_3 = current_price * (1 + pct_3/100.0)
-                    
-                    # Call Legs (Bull Spread)
-                    leg_a = find_closest_strike(calls, price_1)
-                    leg_b = find_closest_strike(calls, price_2)
-                    # Put Leg (Naked Short)
-                    leg_c = find_closest_strike(puts, price_3)
-
-                    if leg_a is None or leg_b is None or leg_c is None: continue
-                    if leg_a['strike'] == leg_b['strike']: continue
-
-                    # Enforce Bull Call Structure
-                    buy_leg = leg_a if leg_a['strike'] < leg_b['strike'] else leg_b
-                    sell_leg = leg_b if leg_a['strike'] < leg_b['strike'] else leg_a
-                    put_leg = leg_c
-
-                    buy_strike, sell_strike = buy_leg['strike'], sell_leg['strike']
-                    put_strike = put_leg['strike']
-
-                    buy_prem, sell_prem = get_price(buy_leg, 'ask'), get_price(sell_leg, 'bid')
-                    put_prem = get_price(put_leg, 'bid') # Sell Put
-
-                    # Net Cost = (Buy Call - Sell Call) - Sell Put
-                    call_spread_cost = buy_prem - sell_prem
-                    net_cost = call_spread_cost - put_prem # If negative -> Credit
-                    
-                    # Margin: Need API or estimate
-                    margin = 0.0
-                    if adapter and hasattr(adapter, 'get_margin_for_basket'):
-                        legs = [
-                            {'row': buy_leg.to_dict(), 'action': 'Buy', 'type': 'Call'},
-                            {'row': sell_leg.to_dict(), 'action': 'Sell', 'type': 'Call'},
-                            {'row': put_leg.to_dict(), 'action': 'Sell', 'type': 'Put'}
-                        ]
-                        api_margin = adapter.get_margin_for_basket(legs, lot_size)
-                        if api_margin > 0: margin = api_margin
-                    
-                    if margin == 0: 
-                        # Fallback margin approx: Put Strike * 0.15 (15% of spot)
-                        margin = (put_strike * 0.15) * lot_size
-                        # Convert back to per share for consistent math
-                        margin = margin / lot_size 
-                        
-                    max_gain = (sell_strike - buy_strike) - net_cost
-                    breakeven = put_strike + net_cost if net_cost > 0 else put_strike - abs(net_cost)
-                    
-                    # ROI on Margin
-                    if margin > 0: ret_pct = (max_gain / margin) * 100
-
-                # -- COMMON OUTPUT --
-                if strategy_type != "Long Straddle":
-                    cost_cmp_pct = 0.0
-                    if margin > 0 and current_price > 0:
-                        cost_cmp_pct = (margin / current_price) * 100
-
-                    base_row = {
-                        "Expiration": date_str, 
-                        "Spot Price": float(current_price),
-                        "Lot Size": lot_size,
-                        "Net Cost": net_cost,
-                        "Cost/CMP %": cost_cmp_pct,
-                        "Max Gain": max_gain, 
-                        "Margin Required": margin, # Per share margin here, will scale later
-                        "Return %": ret_pct, 
-                        "Breakeven": breakeven
-                    }
-                    
-                    # Add leg specific columns
-                    if strategy_type == "Leveraged Bull Call Spread":
-                         base_row.update({
-                             "Buy Call Strike": buy_strike, "Buy Call Prem": buy_prem,
-                             "Sell Call Strike": sell_strike, "Sell Call Prem": sell_prem,
-                             "Sell Put Strike": put_strike, "Sell Put Prem": put_prem
-                         })
-                    else:
-                         base_row.update({
-                            "Buy Strike": buy_strike, "Buy Premium": buy_prem,
-                            "Sell Strike": sell_strike, "Sell Premium": sell_prem,
-                         })
-                         
-                    analysis_rows.append(base_row)
-                    summary_returns[date_str] = f"{ret_pct:.1f}%"
-                
-                # STRADDLE Logic
-                elif strategy_type == "Long Straddle":
-                    common = set(calls['strike']).intersection(set(puts['strike']))
-                    if not common: continue
-                    avail = pd.DataFrame({'strike': list(common)})
-                    closest = find_closest_strike(avail, current_price)
-                    if closest is None: continue
-                    strike = closest['strike']
-                    c = calls[calls['strike'] == strike].iloc[0]
-                    p = puts[puts['strike'] == strike].iloc[0]
-                    c_ask, p_ask = get_price(c, 'ask'), get_price(p, 'ask')
-                    if c_ask == 0 or p_ask == 0: continue
-                    net_cost = c_ask + p_ask
-                    
-                    cost_cmp_pct = 0.0
-                    if current_price > 0:
-                        cost_cmp_pct = (net_cost / current_price) * 100
-                        
-                    analysis_rows.append({
-                        "Expiration": date_str, "Spot Price": float(current_price), "Lot Size": lot_size,
-                        "Strike": strike, "Call Cost": c_ask, "Put Cost": p_ask, "Net Cost": net_cost, 
-                        "Cost/CMP %": cost_cmp_pct,
-                        "BE Low": strike - net_cost, "BE High": strike + net_cost, "Move Needed": (net_cost / current_price) * 100
-                    })
-                    summary_returns[date_str] = f"±{ (net_cost / current_price) * 100:.1f}%"
-
-            except: continue
-
-        if not analysis_rows: return None, None, "Could not build strategies."
-        
-        # Convert to DataFrame
-        df = pd.DataFrame(analysis_rows)
-        
-        # Data Cleaning: Force Numeric Types
-        if not df.empty:
-            cols_to_numeric = ["Spot Price", "Lot Size", "Buy Strike", "Buy Premium", "Buy Call Strike", "Buy Call Prem", "Sell Strike", "Sell Premium", "Sell Call Strike", "Sell Call Prem", "Sell Put Strike", "Sell Put Prem", "Net Cost", "Max Gain", "Breakeven", "Return %", "Cost/CMP %", "Strike", "Call Cost", "Put Cost", "BE Low", "BE High", "Move Needed", "Margin Required"]
-            for col in cols_to_numeric:
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
-                    df[col] = df[col].replace([float('inf'), float('-inf')], 0.0)
-
-        return summary_returns, df, None
-
-    except Exception as e:
-        return None, None, str(e)
-
-# ==========================================
-# CUSTOM 4-LEG STRATEGY (HYBRID)
-# ==========================================
-def calculate_strategy_metrics(legs, current_price, view, lot_size=1, adapter=None):
-    net_premium = 0.0
-    strikes = []
-    
-    for leg in legs:
-        strikes.append(leg['row']['strike'])
-        price = get_price(leg['row'], 'ask' if leg['action'] == "Buy" else 'bid')
-        impact = -price if leg['action'] == "Buy" else price
-        net_premium += impact
-
-    sim_prices = sorted(strikes + [current_price])
-    range_width = max(strikes) - min(strikes)
-    sim_range = [min(strikes) - range_width*0.5] + sim_prices + [max(strikes) + range_width*0.5]
-    
-    profits = []
-    for p in sim_range:
-        current_pnl = net_premium
-        for leg in legs:
-            strike = leg['row']['strike']
-            is_call = leg['type'] == "Call"
-            is_buy = leg['action'] == "Buy"
-            intrinsic = max(0, p - strike) if is_call else max(0, strike - p)
-            current_pnl += (intrinsic if is_buy else -intrinsic)
-        profits.append(current_pnl)
-
-    max_profit_per_share = max(profits)
-    max_loss_per_share = min(profits)
-    
-    capital_required = 0.0
-    if adapter and hasattr(adapter, 'get_margin_for_basket'):
-        api_margin = adapter.get_margin_for_basket(legs, lot_size)
-        if api_margin > 0: capital_required = api_margin
-    
-    if capital_required == 0:
-        # Fallback logic
-        total_premium_lot = net_premium * lot_size
-        puts = sorted([l for l in legs if l['type'] == 'Put'], key=lambda x: x['row']['strike'])
-        calls = sorted([l for l in legs if l['type'] == 'Call'], key=lambda x: x['row']['strike'])
-        if len(puts) == 2 and len(calls) == 2:
-            width = max(abs(puts[1]['row']['strike'] - puts[0]['row']['strike']), abs(calls[1]['row']['strike'] - calls[0]['row']['strike']))
-            if view == "Neutral": capital_required = width * lot_size
-            else: capital_required = abs(total_premium_lot) if total_premium_lot < 0 else 0.0
-
-    brokerage = 20 * 4 if lot_size > 1 else 0.05 * 4
-    net_max_profit = (max_profit_per_share * lot_size) - brokerage
-    roi = (net_max_profit / capital_required * 100) if capital_required > 0 else 0.0
-
-    return {
-        "net_premium": net_premium, "max_upside": max_profit_per_share, "max_loss": max_loss_per_share,
-        "capital_required": capital_required, "brokerage": brokerage, "net_max_profit": net_max_profit, "roi": roi, "lot_size": lot_size
-    }
-
-@st.cache_data(ttl=300, show_spinner=False)
-def analyze_custom_strategy(ticker, view, slab1_pct, slab2_pct, days_window, region="USA", source="Yahoo", z_api=None, z_token=None, optimize=False):
+def fetch_and_analyze_ticker_hybrid_v16(ticker, strategy_type, region="USA", source="Yahoo", z_api=None, z_token=None, pct_1=0.0, pct_2=5.0, pct_3=0.0, expiry_idx=0):
     adapter = None
     if region == "India":
         if source == "Zerodha (API)":
@@ -870,6 +441,9 @@ def analyze_custom_strategy(ticker, view, slab1_pct, slab2_pct, days_window, reg
             clean_ticker = ticker.replace(".NS", "")
             current_price = adapter.get_spot_price(clean_ticker)
             if source == "Zerodha (API)": lot_size = adapter.get_lot_size(clean_ticker)
+            else: 
+                lots = get_fno_info_zerodha()
+                lot_size = int(lots.get(clean_ticker, 1))
             try:
                 stock = yf.Ticker(f"{clean_ticker}.NS")
                 earnings_date = get_next_earnings_date(stock)
@@ -888,18 +462,25 @@ def analyze_custom_strategy(ticker, view, slab1_pct, slab2_pct, days_window, reg
         valid_dates, raw_data, valid_instruments = [], None, None
         if region == "India":
             if source == "Zerodha (API)":
-                valid_dates, valid_instruments = adapter.get_chain_for_symbol(clean_ticker, days_limit=days_window)
+                valid_dates, valid_instruments = adapter.get_chain_for_symbol(clean_ticker, days_limit=90)
             else:
-                valid_dates, raw_data = adapter.get_expirations(clean_ticker, days_limit=days_window)
+                valid_dates, raw_data = adapter.get_expirations(clean_ticker, days_limit=90)
         else:
             stock = yf.Ticker(ticker)
-            dates = get_expirations_within_days(stock, days_limit=days_window)
-            valid_dates = dates
+            try:
+                valid_dates = get_monthly_expirations(stock, limit=3)
+            except: pass
 
         if not valid_dates: return None, f"No expirations found."
         
-        results_list = []
-        errors = []
+        if region == "India" and valid_dates:
+            if expiry_idx < len(valid_dates):
+                valid_dates = [valid_dates[expiry_idx]]
+            else:
+                valid_dates = [valid_dates[-1]]
+
+        analysis_rows = []
+        summary_returns = {"Stock": ticker}
 
         for date_obj in valid_dates:
             try:
@@ -918,87 +499,241 @@ def analyze_custom_strategy(ticker, view, slab1_pct, slab2_pct, days_window, reg
                 puts = filter_tradeable_options(puts).sort_values('strike').reset_index(drop=True)
                 if calls.empty or puts.empty: continue
 
-                s1, s2 = slab1_pct / 100.0, slab2_pct / 100.0
-                targets = {
-                    "pf": current_price * (1 - s2), "pn": current_price * (1 - s1),
-                    "cn": current_price * (1 + s1), "cf": current_price * (1 + s2)
-                }
+                price_1 = current_price * (1 + pct_1/100.0)
+                price_2 = current_price * (1 + pct_2/100.0)
                 
-                def build_legs(pf_row, pn_row, cn_row, cf_row):
-                    l = []
-                    if view == "Neutral":
-                        l = [
-                            {"type": "Put", "action": "Buy", "row": pf_row, "desc": f"Put Long (-{slab2_pct}%)"},
-                            {"type": "Put", "action": "Sell", "row": pn_row, "desc": f"Put Short (-{slab1_pct}%)"},
-                            {"type": "Call", "action": "Sell", "row": cn_row, "desc": f"Call Short (+{slab1_pct}%)"},
-                            {"type": "Call", "action": "Buy", "row": cf_row, "desc": f"Call Long (+{slab2_pct}%)"},
-                        ]
+                legs_list = []
+
+                buy_leg, sell_leg, put_leg = None, None, None
+                buy_strike, sell_strike, put_strike = 0.0, 0.0, 0.0
+                buy_prem, sell_prem, put_prem = 0.0, 0.0, 0.0
+                net_cost, max_gain, breakeven, ret_pct, margin, rom_pct, roc_pct = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+
+                if strategy_type == "Bull Call Spread":
+                    leg_a = find_closest_strike(calls, price_1)
+                    leg_b = find_closest_strike(calls, price_2)
+                    
+                    if leg_a is None or leg_b is None or leg_a['strike'] == leg_b['strike']: continue
+                    
+                    buy_leg = leg_a if leg_a['strike'] < leg_b['strike'] else leg_b
+                    sell_leg = leg_b if leg_a['strike'] < leg_b['strike'] else leg_a
+                    
+                    buy_strike, sell_strike = buy_leg['strike'], sell_leg['strike']
+                    buy_prem, sell_prem = get_price(buy_leg, 'ask'), get_price(sell_leg, 'bid')
+                    if buy_prem == 0: continue
+                    
+                    net_cost = buy_prem - sell_prem
+                    max_gain = sell_strike - buy_strike
+                    breakeven = buy_strike + net_cost
+                    margin = net_cost
+                    
+                    legs_list = [
+                        {'row': buy_leg.to_dict(), 'action': 'Buy', 'type': 'Call'},
+                        {'row': sell_leg.to_dict(), 'action': 'Sell', 'type': 'Call'}
+                    ]
+
+                elif strategy_type == "Bear Call Spread":
+                    leg_a = find_closest_strike(calls, price_1)
+                    leg_b = find_closest_strike(calls, price_2)
+                    
+                    if leg_a is None or leg_b is None or leg_a['strike'] == leg_b['strike']: continue
+                    
+                    sell_leg = leg_a if leg_a['strike'] < leg_b['strike'] else leg_b
+                    buy_leg = leg_b if leg_a['strike'] < leg_b['strike'] else leg_a
+                    
+                    buy_strike, sell_strike = buy_leg['strike'], sell_leg['strike']
+                    buy_prem, sell_prem = get_price(buy_leg, 'ask'), get_price(sell_leg, 'bid')
+                    
+                    net_cost = buy_prem - sell_prem 
+                    max_gain = abs(net_cost)
+                    breakeven = sell_strike + max_gain
+                    
+                    legs_list = [
+                        {'row': buy_leg.to_dict(), 'action': 'Buy', 'type': 'Call'},
+                        {'row': sell_leg.to_dict(), 'action': 'Sell', 'type': 'Call'}
+                    ]
+
+                elif strategy_type == "Bull Put Spread":
+                    leg_a = find_closest_strike(puts, price_1)
+                    leg_b = find_closest_strike(puts, price_2)
+                    
+                    if leg_a is None or leg_b is None or leg_a['strike'] == leg_b['strike']: continue
+                    
+                    buy_leg = leg_a if leg_a['strike'] < leg_b['strike'] else leg_b
+                    sell_leg = leg_b if leg_a['strike'] < leg_b['strike'] else leg_a
+                    
+                    buy_strike, sell_strike = buy_leg['strike'], sell_leg['strike']
+                    buy_prem, sell_prem = get_price(buy_leg, 'ask'), get_price(sell_leg, 'bid')
+                    
+                    net_cost = buy_prem - sell_prem
+                    max_gain = abs(net_cost)
+                    breakeven = sell_strike - max_gain
+                    
+                    legs_list = [
+                        {'row': buy_leg.to_dict(), 'action': 'Buy', 'type': 'Put'},
+                        {'row': sell_leg.to_dict(), 'action': 'Sell', 'type': 'Put'}
+                    ]
+
+                elif strategy_type == "Bear Put Spread":
+                    leg_a = find_closest_strike(puts, price_1)
+                    leg_b = find_closest_strike(puts, price_2)
+                    
+                    if leg_a is None or leg_b is None or leg_a['strike'] == leg_b['strike']: continue
+                    
+                    sell_leg = leg_a if leg_a['strike'] < leg_b['strike'] else leg_b
+                    buy_leg = leg_b if leg_a['strike'] < leg_b['strike'] else leg_a
+                    
+                    buy_strike, sell_strike = buy_leg['strike'], sell_leg['strike']
+                    buy_prem, sell_prem = get_price(buy_leg, 'ask'), get_price(sell_leg, 'bid')
+                    
+                    if buy_prem == 0: continue
+                    net_cost = buy_prem - sell_prem
+                    max_gain = buy_strike - sell_strike
+                    breakeven = buy_strike - net_cost
+                    margin = net_cost
+                    
+                    legs_list = [
+                        {'row': buy_leg.to_dict(), 'action': 'Buy', 'type': 'Put'},
+                        {'row': sell_leg.to_dict(), 'action': 'Sell', 'type': 'Put'}
+                    ]
+                
+                elif strategy_type == "Leveraged Bull Call Spread":
+                    price_3 = current_price * (1 + pct_3/100.0)
+                    leg_a = find_closest_strike(calls, price_1)
+                    leg_b = find_closest_strike(calls, price_2)
+                    leg_c = find_closest_strike(puts, price_3)
+
+                    if leg_a is None or leg_b is None or leg_c is None: continue
+                    if leg_a['strike'] == leg_b['strike']: continue
+
+                    buy_leg = leg_a if leg_a['strike'] < leg_b['strike'] else leg_b
+                    sell_leg = leg_b if leg_a['strike'] < leg_b['strike'] else leg_a
+                    put_leg = leg_c
+
+                    buy_strike, sell_strike = buy_leg['strike'], sell_leg['strike']
+                    put_strike = put_leg['strike']
+
+                    buy_prem, sell_prem = get_price(buy_leg, 'ask'), get_price(sell_leg, 'bid')
+                    put_prem = get_price(put_leg, 'bid')
+
+                    net_cost = (buy_prem - sell_prem) - put_prem
+                    max_gain = (sell_strike - buy_strike) - net_cost
+                    breakeven = put_strike + net_cost if net_cost > 0 else put_strike - abs(net_cost)
+                    
+                    legs_list = [
+                        {'row': buy_leg.to_dict(), 'action': 'Buy', 'type': 'Call'},
+                        {'row': sell_leg.to_dict(), 'action': 'Sell', 'type': 'Call'},
+                        {'row': put_leg.to_dict(), 'action': 'Sell', 'type': 'Put'}
+                    ]
+
+                if legs_list:
+                    # 1. Get Margin via API (Zerodha) if available
+                    margin = 0.0
+                    if adapter and hasattr(adapter, 'get_margin_for_basket'):
+                        api_margin = adapter.get_margin_for_basket(legs_list, lot_size)
+                        if api_margin > 0: margin = api_margin
+                    
+                    # 2. Fallback Margin Estimate if API failed or not used
+                    if margin == 0:
+                        if strategy_type in ["Bull Call Spread", "Bear Put Spread"]:
+                            margin = net_cost * lot_size if net_cost > 0 else 0
+                        elif strategy_type in ["Bear Call Spread", "Bull Put Spread"]:
+                            # Credit Spread Margin approx: Spread Width * Lot Size
+                            margin = abs(buy_strike - sell_strike) * lot_size
+                        elif strategy_type == "Leveraged Bull Call Spread":
+                             margin = (put_strike * 0.15 * lot_size)
+
+                    total_max_gain = max_gain * lot_size
+                    total_net_cost = net_cost * lot_size
+                    
+                    # 3. Return on Margin (ROM)
+                    if margin > 0:
+                        rom_pct = (total_max_gain / margin) * 100
+                    
+                    # 4. Return on Cost (ROC)
+                    if total_net_cost > 0:
+                        roc_pct = (total_max_gain / total_net_cost) * 100
                     else:
-                        l = [
-                            {"type": "Put", "action": "Sell", "row": pf_row, "desc": f"Put Short (-{slab2_pct}%)"},
-                            {"type": "Put", "action": "Buy", "row": pn_row, "desc": f"Put Long (-{slab1_pct}%)"},
-                            {"type": "Call", "action": "Buy", "row": cn_row, "desc": f"Call Long (+{slab1_pct}%)"},
-                            {"type": "Call", "action": "Sell", "row": cf_row, "desc": f"Call Short (+{slab2_pct}%)"},
-                        ]
-                    return l
+                        roc_pct = 0.0
 
-                pf, pn = find_closest_strike(puts, targets["pf"]), find_closest_strike(puts, targets["pn"])
-                cn, cf = find_closest_strike(calls, targets["cn"]), find_closest_strike(calls, targets["cf"])
-                if any(x is None for x in [pf, pn, cn, cf]): continue
+                if strategy_type != "Long Straddle":
+                    cost_cmp_pct = 0.0
+                    # For comparison, margin per share is margin/lot size
+                    margin_per_share = margin / lot_size if lot_size > 0 else 0
+                    if margin_per_share > 0 and current_price > 0:
+                        cost_cmp_pct = (margin_per_share / current_price) * 100
 
-                base_legs = build_legs(pf, pn, cn, cf)
-                base_metrics = calculate_strategy_metrics(base_legs, current_price, view, lot_size, adapter)
-                
-                payload = {
-                    "ticker": ticker, "current_price": current_price, "expiry": date_str, "earnings": earnings_date,
-                    "base": {"metrics": base_metrics, "legs": base_legs}, "optimized": None 
-                }
-
-                if optimize:
-                    def get_idx(df, strike): 
-                        indices = df.index[df['strike'] == strike].tolist()
-                        return indices[0] if indices else -1
+                    base_row = {
+                        "Expiration": date_str, 
+                        "Spot Price": float(current_price),
+                        "Lot Size": lot_size,
+                        "Net Cost": net_cost,
+                        "Cost/CMP %": cost_cmp_pct,
+                        "Max Gain": max_gain, 
+                        "Margin Required": margin, 
+                        "Return on Margin %": rom_pct,
+                        "Return on Cost %": roc_pct if total_net_cost > 0 else None,
+                        "Breakeven": breakeven
+                    }
                     
-                    pf_idx, pn_idx = get_idx(puts, pf['strike']), get_idx(puts, pn['strike'])
-                    cn_idx, cf_idx = get_idx(calls, cn['strike']), get_idx(calls, cf['strike'])
-                    
-                    if not any(i == -1 for i in [pf_idx, pn_idx, cn_idx, cf_idx]):
-                        best_ratio = -1.0
-                        best_config = None
-                        range_scan = range(-1, 2)
-                        
-                        for i1 in range_scan:
-                            for i2 in range_scan:
-                                for i3 in range_scan:
-                                    for i4 in range_scan:
-                                        if not (0<=pf_idx+i1<len(puts) and 0<=pn_idx+i2<len(puts) and 0<=cn_idx+i3<len(calls) and 0<=cf_idx+i4<len(calls)): continue
-                                        pf_cand = puts.iloc[pf_idx+i1]
-                                        pn_cand = puts.iloc[pn_idx+i2]
-                                        cn_cand = calls.iloc[cn_idx+i3]
-                                        cf_cand = calls.iloc[cf_idx+i4]
-                                        
-                                        if pf_cand['strike']>=pn_cand['strike'] or cn_cand['strike']>=cf_cand['strike']: continue
-                                        
-                                        cand_legs = build_legs(pf_cand, pn_cand, cn_cand, cf_cand)
-                                        cand_metrics = calculate_strategy_metrics(cand_legs, current_price, view, lot_size, None)
-                                        loss = abs(cand_metrics['max_loss'])
-                                        ratio = cand_metrics['max_upside'] / loss if loss > 0.01 else 0
-                                        if ratio > best_ratio:
-                                            best_ratio = ratio
-                                            best_config = {"metrics": cand_metrics, "legs": cand_legs, "ratio": ratio}
-                        
-                        if best_config:
-                            best_config['metrics'] = calculate_strategy_metrics(best_config['legs'], current_price, view, lot_size, adapter)
-                            payload["optimized"] = best_config
+                    if strategy_type == "Leveraged Bull Call Spread":
+                         base_row.update({
+                             "Buy Call Strike": buy_strike, "Buy Call Prem": buy_prem,
+                             "Sell Call Strike": sell_strike, "Sell Call Prem": sell_prem,
+                             "Sell Put Strike": put_strike, "Sell Put Prem": put_prem
+                         })
+                    else:
+                         base_row.update({
+                            "Buy Strike": buy_strike, "Buy Premium": buy_prem,
+                            "Sell Strike": sell_strike, "Sell Premium": sell_prem,
+                         })
+                         
+                    analysis_rows.append(base_row)
+                    summary_returns[date_str] = f"{rom_pct:.1f}%"
                 
-                results_list.append(payload)
-            except Exception as e:
-                errors.append(f"Date {date_str}: {str(e)}")
-                continue
+                elif strategy_type == "Long Straddle":
+                    common = set(calls['strike']).intersection(set(puts['strike']))
+                    if not common: continue
+                    avail = pd.DataFrame({'strike': list(common)})
+                    closest = find_closest_strike(avail, current_price)
+                    if closest is None: continue
+                    strike = closest['strike']
+                    c = calls[calls['strike'] == strike].iloc[0]
+                    p = puts[puts['strike'] == strike].iloc[0]
+                    c_ask, p_ask = get_price(c, 'ask'), get_price(p, 'ask')
+                    if c_ask == 0 or p_ask == 0: continue
+                    net_cost = c_ask + p_ask
+                    
+                    margin = net_cost * lot_size
+                    cost_cmp_pct = 0.0
+                    if current_price > 0:
+                        cost_cmp_pct = (net_cost / current_price) * 100
+                        
+                    analysis_rows.append({
+                        "Expiration": date_str, "Spot Price": float(current_price), "Lot Size": lot_size,
+                        "Strike": strike, "Call Cost": c_ask, "Put Cost": p_ask, "Net Cost": net_cost, 
+                        "Cost/CMP %": cost_cmp_pct,
+                        "Margin Required": margin,
+                        "BE Low": strike - net_cost, "BE High": strike + net_cost, "Move Needed": (net_cost / current_price) * 100
+                    })
+                    summary_returns[date_str] = f"±{ (net_cost / current_price) * 100:.1f}%"
 
-        if not results_list: return None, "Could not build strategies."
-        return results_list, None
-    except Exception as e: return None, str(e)
+            except: continue
+
+        if not analysis_rows: return None, None, "Could not build strategies."
+        
+        df = pd.DataFrame(analysis_rows)
+        if not df.empty:
+            cols_to_numeric = ["Spot Price", "Lot Size", "Buy Strike", "Buy Premium", "Buy Call Strike", "Buy Call Prem", "Sell Strike", "Sell Premium", "Sell Call Strike", "Sell Call Prem", "Sell Put Strike", "Sell Put Prem", "Net Cost", "Max Gain", "Breakeven", "Return on Margin %", "Return on Cost %", "Cost/CMP %", "Strike", "Call Cost", "Put Cost", "BE Low", "BE High", "Move Needed", "Margin Required"]
+            for col in cols_to_numeric:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
+                    df[col] = df[col].replace([float('inf'), float('-inf')], 0.0)
+
+        return summary_returns, df, None
+
+    except Exception as e:
+        return None, None, str(e)
 
 # ==========================================
 # PART 3: MAIN APP INTERFACE
@@ -1011,7 +746,6 @@ def display_strategy_details(data, label, current_price):
     net = m['net_premium']
     lbl = "Net Credit (Total)" if net > 0 else "Net Debit (Total)"
     
-    # Financials are now TOTAL LOT
     total_prem = net * m['lot_size']
     
     c1.metric("Margin (1 Lot)", f"${m['capital_required']:,.0f}")
@@ -1032,6 +766,11 @@ def display_strategy_details(data, label, current_price):
 def main():
     st.title("🛡️ Options Strategy Master")
     
+    # 1. Sidebar Buttons
+    if st.sidebar.button("🔄 Clear Cache & Restart"):
+        st.cache_data.clear()
+        st.rerun()
+        
     region = st.sidebar.selectbox("Select Market Region", ["USA (Yahoo)", "India"])
     region_key = "USA" if "USA" in region else "India"
     
@@ -1046,7 +785,6 @@ def main():
             z_api = st.sidebar.text_input("API Key", value=saved_api if saved_api else "", type="password")
             z_token = st.sidebar.text_input("Access Token", value=saved_token if saved_token else "", type="password")
         
-        # Check token file age
         file_dt = get_token_file_info()
         if file_dt:
              hours_old = (datetime.datetime.now() - file_dt).total_seconds() / 3600
@@ -1112,13 +850,10 @@ def main():
                 progress_bar = st.progress(0)
                 with st.spinner(f"Fetching data..."):
                     for i, ticker in enumerate(tickers):
-                        # Renamed function call to bust cache and force fresh data fetch
-                        summary, df, error = fetch_and_analyze_ticker_hybrid_v15(ticker, strategy, region_key, source, z_api, z_token, pct_1, pct_2, pct_3, expiry_idx)
+                        summary, df, error = fetch_and_analyze_ticker_hybrid_v16(ticker, strategy, region_key, source, z_api, z_token, pct_1, pct_2, pct_3, expiry_idx)
                         if error: errors.append(f"{ticker}: {error}")
                         else:
                             all_summaries.append(summary)
-                            
-                            # Clean numeric columns to avoid string formatting crash
                             all_details[ticker] = df
                             if not df.empty:
                                 df_summary = df.copy()
@@ -1126,6 +861,7 @@ def main():
                                 consolidated_data.append(df_summary)
                         progress_bar.progress((i + 1) / len(tickers))
                 st.divider()
+                
                 if consolidated_data:
                     st.header("1. Strategy Summary")
                     full_df = pd.concat(consolidated_data, ignore_index=True)
@@ -1134,18 +870,18 @@ def main():
                         st.subheader(f"Expiry: {exp}")
                         subset = full_df[full_df['Expiration'] == exp].drop(columns=['Expiration'])
                         
-                        # Define Columns
                         cols_to_show = []
                         if strategy == "Long Straddle":
                             format_dict = {
                                 "Spot Price": "${:,.2f}", "Call Cost": "${:,.2f}", "Put Cost": "${:,.2f}",
                                 "Net Cost": "${:,.2f}", "Cost/CMP %": "{:.2f}%", "BE Low": "${:,.2f}",
-                                "BE High": "${:,.2f}", "Move Needed": "{:.1f}%"
+                                "BE High": "${:,.2f}", "Move Needed": "{:.1f}%", "Margin Required": "${:,.0f}"
                             }
                         elif strategy == "Leveraged Bull Call Spread":
                              format_dict = {
                                 "Spot Price": "${:,.2f}", "Net Cost": "${:,.2f}", "Margin Required": "${:,.0f}",
-                                "Return %": "{:.1f}%", "Max Gain": "${:,.2f}", "Breakeven": "${:,.2f}",
+                                "Return on Margin %": "{:.1f}%", "Return on Cost %": "{:.1f}%", 
+                                "Max Gain": "${:,.2f}", "Breakeven": "${:,.2f}",
                                 "Buy Call Strike": "${:,.2f}", "Sell Call Strike": "${:,.2f}", "Sell Put Strike": "${:,.2f}"
                             }
                         else:
@@ -1153,12 +889,11 @@ def main():
                                 "Spot Price": "${:,.2f}", "Buy Premium": "${:,.2f}", "Sell Premium": "${:,.2f}",
                                 "Net Cost": "${:,.2f}", "Cost/CMP %": "{:.2f}%", "Max Gain": "${:,.2f}",
                                 "Margin Required": "${:,.0f}",
-                                "Breakeven": "${:,.2f}", "Return %": "{:.1f}%"
+                                "Breakeven": "${:,.2f}", "Return on Margin %": "{:.1f}%", "Return on Cost %": "{:.1f}%"
                             }
                         
-                        # Use try/except block for display robustness
                         try:
-                            st.dataframe(subset.style.format(format_dict), hide_index=True, use_container_width=True)
+                            st.dataframe(subset.style.format(format_dict, na_rep="N/A"), hide_index=True, use_container_width=True)
                         except:
                             st.dataframe(subset, hide_index=True, use_container_width=True)
 
@@ -1168,11 +903,9 @@ def main():
                     st.header("2. Detailed Breakdown")
                     for ticker, df in all_details.items():
                         with st.expander(f"{ticker} Details", expanded=False):
-                            
-                            # Formatting reuse logic (same as summary for simplicity)
-                            try:
-                                st.dataframe(df.style.format(format_dict), use_container_width=True)
-                            except Exception as e:
+                             try:
+                                st.dataframe(df.style.format(format_dict, na_rep="N/A"), use_container_width=True)
+                             except Exception as e:
                                 st.error(f"⚠️ Formatting error. Showing raw data.")
                                 st.dataframe(df, use_container_width=True)
                 if errors:
@@ -1181,6 +914,7 @@ def main():
 
     else:
         st.subheader(f"🤖 {region_key} Slab-Based Strategy Generator")
+        # ... (Custom Strategy Section code follows, unchanged logic just re-rendered)
         c1, c2 = st.columns(2)
         def on_preset_custom_change():
             sel = st.session_state.preset_custom
