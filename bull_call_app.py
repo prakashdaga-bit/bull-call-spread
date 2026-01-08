@@ -287,7 +287,9 @@ class ZerodhaMarketAdapter:
             if response and 'initial' in response:
                 return response['initial'].get('total', 0.0)
             return 0.0
-        except: return 0.0
+        except Exception as e:
+            # st.error(f"Margin Calc Error: {e}")
+            return 0.0
 
     def parse_chain(self, valid_instruments, expiry_date):
         expiry_subset = valid_instruments[valid_instruments['expiry'] == expiry_date]
@@ -459,7 +461,7 @@ def get_option_chain_with_retry(stock, date, retries=3):
 # ==========================================
 
 @st.cache_data(ttl=600, show_spinner=False)
-def fetch_and_analyze_ticker_hybrid_v19(ticker, strategy_type, region="USA", source="Yahoo", z_api=None, z_token=None, pct_1=0.0, pct_2=5.0, pct_3=0.0, expiry_idx=0):
+def fetch_and_analyze_ticker_hybrid_v20(ticker, strategy_type, region="USA", source="Yahoo", z_api=None, z_token=None, pct_1=0.0, pct_2=5.0, pct_3=0.0, expiry_idx=0):
     """Handles logic for USA (Yahoo) and India (NSE Scraper OR Zerodha)."""
     
     # 1. Setup Adapter
@@ -733,6 +735,10 @@ def fetch_and_analyze_ticker_hybrid_v19(ticker, strategy_type, region="USA", sou
                     margin_per_share = margin / lot_size if lot_size > 0 else 0
                     if margin_per_share > 0 and current_price > 0:
                         cost_cmp_pct = (margin_per_share / current_price) * 100
+                    
+                    # Calculate Brokerage
+                    brokerage = 20 * 4 if lot_size > 1 else 0.05 * 4
+                    net_max_profit_val = total_max_gain - brokerage
 
                     base_row = {
                         "Expiration": date_str, 
@@ -744,7 +750,9 @@ def fetch_and_analyze_ticker_hybrid_v19(ticker, strategy_type, region="USA", sou
                         "Margin Required": margin, 
                         "Return on Margin %": rom_pct,
                         "Return on Cost %": roc_pct if total_net_cost > 0 else None,
-                        "Breakeven": breakeven
+                        "Breakeven": breakeven,
+                        "Est. Brokerage": brokerage,
+                        "Net Max Profit": net_max_profit_val
                     }
                     
                     if strategy_type == "Leveraged Bull Call Spread":
@@ -799,7 +807,7 @@ def fetch_and_analyze_ticker_hybrid_v19(ticker, strategy_type, region="USA", sou
         
         # Data Cleaning: Force Numeric Types
         if not df.empty:
-            cols_to_numeric = ["Spot Price", "Lot Size", "Buy Strike", "Buy Premium", "Buy Call Strike", "Buy Call Prem", "Sell Strike", "Sell Premium", "Sell Call Strike", "Sell Call Prem", "Sell Put Strike", "Sell Put Prem", "Net Cost", "Max Gain", "Breakeven", "Return on Margin %", "Return on Cost %", "Cost/CMP %", "Strike", "Call Cost", "Put Cost", "BE Low", "BE High", "Move Needed", "Margin Required"]
+            cols_to_numeric = ["Spot Price", "Lot Size", "Buy Strike", "Buy Premium", "Buy Call Strike", "Buy Call Prem", "Sell Strike", "Sell Premium", "Sell Call Strike", "Sell Call Prem", "Sell Put Strike", "Sell Put Prem", "Net Cost", "Max Gain", "Breakeven", "Return on Margin %", "Return on Cost %", "Cost/CMP %", "Strike", "Call Cost", "Put Cost", "BE Low", "BE High", "Move Needed", "Margin Required", "Est. Brokerage", "Net Max Profit"]
             for col in cols_to_numeric:
                 if col in df.columns:
                     # Coerce errors to NaN, then fill with 0.0. 
@@ -809,7 +817,7 @@ def fetch_and_analyze_ticker_hybrid_v19(ticker, strategy_type, region="USA", sou
         
         # Reorder columns for visibility
         if not df.empty and strategy_type != "Long Straddle":
-             cols = ["Expiration", "Spot Price", "Cost/CMP %", "Return %", "Net Cost", "Max Gain", "Buy Strike", "Sell Strike", "Buy Premium", "Sell Premium", "Breakeven", "Lot Size"]
+             cols = ["Expiration", "Spot Price", "Cost/CMP %", "Return on Margin %", "Net Cost", "Max Gain", "Buy Strike", "Sell Strike", "Buy Premium", "Sell Premium", "Breakeven", "Lot Size", "Margin Required", "Net Max Profit"]
              # Keep only cols that exist
              cols = [c for c in cols if c in df.columns]
              df = df[cols]
@@ -1137,7 +1145,7 @@ def main():
                 with st.spinner(f"Fetching data..."):
                     for i, ticker in enumerate(tickers):
                         # Renamed function call to bust cache and force fresh data fetch
-                        summary, df, error = fetch_and_analyze_ticker_hybrid_v19(ticker, strategy, region_key, source, z_api, z_token, pct_2, pct_1, pct_3, expiry_idx)
+                        summary, df, error = fetch_and_analyze_ticker_hybrid_v20(ticker, strategy, region_key, source, z_api, z_token, pct_2, pct_1, pct_3, expiry_idx)
                         if error: errors.append(f"{ticker}: {error}")
                         else:
                             all_summaries.append(summary)
@@ -1150,7 +1158,6 @@ def main():
                                 consolidated_data.append(df_summary)
                         progress_bar.progress((i + 1) / len(tickers))
                 st.divider()
-                
                 if consolidated_data:
                     st.header("1. Strategy Summary")
                     full_df = pd.concat(consolidated_data, ignore_index=True)
@@ -1171,14 +1178,16 @@ def main():
                                 "Spot Price": "${:,.2f}", "Net Cost": "${:,.2f}", "Margin Required": "${:,.0f}",
                                 "Return on Margin %": "{:.1f}%", "Return on Cost %": "{:.1f}%", 
                                 "Max Gain": "${:,.2f}", "Breakeven": "${:,.2f}",
-                                "Buy Call Strike": "${:,.2f}", "Sell Call Strike": "${:,.2f}", "Sell Put Strike": "${:,.2f}"
+                                "Buy Call Strike": "${:,.2f}", "Sell Call Strike": "${:,.2f}", "Sell Put Strike": "${:,.2f}",
+                                "Est. Brokerage": "${:,.2f}", "Net Max Profit": "${:,.0f}"
                             }
                         else:
                             format_dict = {
                                 "Spot Price": "${:,.2f}", "Buy Premium": "${:,.2f}", "Sell Premium": "${:,.2f}",
                                 "Net Cost": "${:,.2f}", "Cost/CMP %": "{:.2f}%", "Max Gain": "${:,.2f}",
                                 "Margin Required": "${:,.0f}",
-                                "Breakeven": "${:,.2f}", "Return on Margin %": "{:.1f}%", "Return on Cost %": "{:.1f}%"
+                                "Breakeven": "${:,.2f}", "Return on Margin %": "{:.1f}%", "Return on Cost %": "{:.1f}%",
+                                "Est. Brokerage": "${:,.2f}", "Net Max Profit": "${:,.0f}"
                             }
                         
                         try:
