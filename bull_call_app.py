@@ -107,12 +107,9 @@ class NSEMarketAdapter:
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "*/*",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
             "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Connection": "keep-alive",
-            "Referer": "https://www.nseindia.com/option-chain"
+            "Accept-Encoding": "gzip, deflate, br"
         })
         try:
             self.session.get(self.BASE_URL, timeout=5)
@@ -133,18 +130,9 @@ class NSEMarketAdapter:
                 if not hist.empty: price = hist['Close'].iloc[-1]
             return float(price) if price is not None else None
         except: return None
-        
-    def get_lot_size(self, ticker):
-        """Fetches lot size from Zerodha Public Dump."""
-        lots = get_fno_info_zerodha()
-        return int(lots.get(ticker, 1))
 
     def fetch_option_chain_raw(self, ticker):
-        if ticker in self.INDICES:
-            url = f"https://www.nseindia.com/api/option-chain-indices?symbol={ticker}"
-        else:
-            url = f"https://www.nseindia.com/api/option-chain-equities?symbol={ticker.upper()}"
-            
+        url = f"https://www.nseindia.com/api/option-chain-indices?symbol={ticker}" if ticker in self.INDICES else f"https://www.nseindia.com/api/option-chain-equities?symbol={ticker}"
         try:
             response = self.session.get(url, timeout=10)
             if response.status_code == 401:
@@ -164,10 +152,8 @@ class NSEMarketAdapter:
         for d_str in expiry_dates:
             try:
                 d = datetime.datetime.strptime(d_str, "%d-%b-%Y").date()
-                if today <= d <= limit:
-                    valid_dates.append(d_str)
-            except:
-                continue
+                if today <= d <= limit: valid_dates.append(d_str)
+            except: continue
         return valid_dates, data
 
     def parse_chain(self, raw_data, expiry_date_str):
@@ -265,6 +251,7 @@ class ZerodhaMarketAdapter:
                 time.sleep(0.1)
             return quotes
         except Exception as e:
+            st.error(f"Quote Fetch Error: {e}")
             return {}
 
     def get_lot_size(self, ticker):
@@ -472,7 +459,7 @@ def get_option_chain_with_retry(stock, date, retries=3):
 # ==========================================
 
 @st.cache_data(ttl=600, show_spinner=False)
-def fetch_and_analyze_ticker_hybrid_v17(ticker, strategy_type, region="USA", source="Yahoo", z_api=None, z_token=None, pct_1=0.0, pct_2=5.0, pct_3=0.0, expiry_idx=0):
+def fetch_and_analyze_ticker_hybrid_v19(ticker, strategy_type, region="USA", source="Yahoo", z_api=None, z_token=None, pct_1=0.0, pct_2=5.0, pct_3=0.0, expiry_idx=0):
     """Handles logic for USA (Yahoo) and India (NSE Scraper OR Zerodha)."""
     
     # 1. Setup Adapter
@@ -819,11 +806,218 @@ def fetch_and_analyze_ticker_hybrid_v17(ticker, strategy_type, region="USA", sou
                     # Also replace infinite values if any logic caused division by zero.
                     df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
                     df[col] = df[col].replace([float('inf'), float('-inf')], 0.0)
+        
+        # Reorder columns for visibility
+        if not df.empty and strategy_type != "Long Straddle":
+             cols = ["Expiration", "Spot Price", "Cost/CMP %", "Return %", "Net Cost", "Max Gain", "Buy Strike", "Sell Strike", "Buy Premium", "Sell Premium", "Breakeven", "Lot Size"]
+             # Keep only cols that exist
+             cols = [c for c in cols if c in df.columns]
+             df = df[cols]
 
         return summary_returns, df, None
 
     except Exception as e:
         return None, None, str(e)
+
+# ==========================================
+# CUSTOM 4-LEG STRATEGY (HYBRID)
+# ==========================================
+def calculate_strategy_metrics(legs, current_price, view, lot_size=1, adapter=None):
+    net_premium = 0.0
+    strikes = []
+    
+    for leg in legs:
+        strikes.append(leg['row']['strike'])
+        price = get_price(leg['row'], 'ask' if leg['action'] == "Buy" else 'bid')
+        impact = -price if leg['action'] == "Buy" else price
+        net_premium += impact
+
+    sim_prices = sorted(strikes + [current_price])
+    range_width = max(strikes) - min(strikes)
+    sim_range = [min(strikes) - range_width*0.5] + sim_prices + [max(strikes) + range_width*0.5]
+    
+    profits = []
+    for p in sim_range:
+        current_pnl = net_premium
+        for leg in legs:
+            strike = leg['row']['strike']
+            is_call = leg['type'] == "Call"
+            is_buy = leg['action'] == "Buy"
+            intrinsic = max(0, p - strike) if is_call else max(0, strike - p)
+            current_pnl += (intrinsic if is_buy else -intrinsic)
+        profits.append(current_pnl)
+
+    max_profit_per_share = max(profits)
+    max_loss_per_share = min(profits)
+    
+    capital_required = 0.0
+    if adapter and hasattr(adapter, 'get_margin_for_basket'):
+        api_margin = adapter.get_margin_for_basket(legs, lot_size)
+        if api_margin > 0: capital_required = api_margin
+    
+    if capital_required == 0:
+        # Fallback logic
+        total_premium_lot = net_premium * lot_size
+        puts = sorted([l for l in legs if l['type'] == 'Put'], key=lambda x: x['row']['strike'])
+        calls = sorted([l for l in legs if l['type'] == 'Call'], key=lambda x: x['row']['strike'])
+        if len(puts) == 2 and len(calls) == 2:
+            width = max(abs(puts[1]['row']['strike'] - puts[0]['row']['strike']), abs(calls[1]['row']['strike'] - calls[0]['row']['strike']))
+            if view == "Neutral": capital_required = width * lot_size
+            else: capital_required = abs(total_premium_lot) if total_premium_lot < 0 else 0.0
+
+    brokerage = 20 * 4 if lot_size > 1 else 0.05 * 4
+    net_max_profit = (max_profit_per_share * lot_size) - brokerage
+    roi = (net_max_profit / capital_required * 100) if capital_required > 0 else 0.0
+
+    return {
+        "net_premium": net_premium, "max_upside": max_profit_per_share, "max_loss": max_loss_per_share,
+        "capital_required": capital_required, "brokerage": brokerage, "net_max_profit": net_max_profit, "roi": roi, "lot_size": lot_size
+    }
+
+@st.cache_data(ttl=300, show_spinner=False)
+def analyze_custom_strategy(ticker, view, slab1_pct, slab2_pct, days_window, region="USA", source="Yahoo", z_api=None, z_token=None, optimize=False):
+    adapter = None
+    if region == "India":
+        if source == "Zerodha (API)":
+            adapter = ZerodhaMarketAdapter(z_api, z_token)
+            if not adapter.connect(): return None, "Zerodha Connection Failed"
+        else: adapter = NSEMarketAdapter()
+    
+    try:
+        lot_size = 1
+        if region == "India":
+            clean_ticker = ticker.replace(".NS", "")
+            current_price = adapter.get_spot_price(clean_ticker)
+            if source == "Zerodha (API)": lot_size = adapter.get_lot_size(clean_ticker)
+            try:
+                stock = yf.Ticker(f"{clean_ticker}.NS")
+                earnings_date = get_next_earnings_date(stock)
+            except: earnings_date = "N/A"
+        else:
+            stock = yf.Ticker(ticker)
+            try:
+                current_price = stock.fast_info['last_price']
+            except:
+                hist = stock.history(period='1d')
+                current_price = hist['Close'].iloc[-1] if not hist.empty else None
+            earnings_date = get_next_earnings_date(stock)
+
+        if not current_price: return None, f"Could not fetch price for {ticker}"
+
+        valid_dates, raw_data, valid_instruments = [], None, None
+        if region == "India":
+            if source == "Zerodha (API)":
+                valid_dates, valid_instruments = adapter.get_chain_for_symbol(clean_ticker, days_limit=days_window)
+            else:
+                valid_dates, raw_data = adapter.get_expirations(clean_ticker, days_limit=days_window)
+        else:
+            stock = yf.Ticker(ticker)
+            dates = get_expirations_within_days(stock, days_limit=days_window)
+            valid_dates = dates
+
+        if not valid_dates: return None, f"No expirations found."
+        
+        results_list = []
+        errors = []
+
+        for date_obj in valid_dates:
+            try:
+                calls, puts = pd.DataFrame(), pd.DataFrame()
+                if isinstance(date_obj, datetime.date): date_str = date_obj.strftime('%Y-%m-%d')
+                else: date_str = date_obj
+                
+                if region == "India":
+                    if source == "Zerodha (API)": calls, puts = adapter.parse_chain(valid_instruments, date_obj)
+                    else: calls, puts = adapter.parse_chain(raw_data, date_str)
+                else:
+                    chain = get_option_chain_with_retry(stock, date_str)
+                    calls, puts = chain.calls, chain.puts
+
+                calls = filter_tradeable_options(calls).sort_values('strike').reset_index(drop=True)
+                puts = filter_tradeable_options(puts).sort_values('strike').reset_index(drop=True)
+                if calls.empty or puts.empty: continue
+
+                s1, s2 = slab1_pct / 100.0, slab2_pct / 100.0
+                targets = {
+                    "pf": current_price * (1 - s2), "pn": current_price * (1 - s1),
+                    "cn": current_price * (1 + s1), "cf": current_price * (1 + s2)
+                }
+                
+                def build_legs(pf_row, pn_row, cn_row, cf_row):
+                    l = []
+                    if view == "Neutral":
+                        l = [
+                            {"type": "Put", "action": "Buy", "row": pf_row, "desc": f"Put Long (-{slab2_pct}%)"},
+                            {"type": "Put", "action": "Sell", "row": pn_row, "desc": f"Put Short (-{slab1_pct}%)"},
+                            {"type": "Call", "action": "Sell", "row": cn_row, "desc": f"Call Short (+{slab1_pct}%)"},
+                            {"type": "Call", "action": "Buy", "row": cf_row, "desc": f"Call Long (+{slab2_pct}%)"},
+                        ]
+                    else:
+                        l = [
+                            {"type": "Put", "action": "Sell", "row": pf_row, "desc": f"Put Short (-{slab2_pct}%)"},
+                            {"type": "Put", "action": "Buy", "row": pn_row, "desc": f"Put Long (-{slab1_pct}%)"},
+                            {"type": "Call", "action": "Buy", "row": cn_row, "desc": f"Call Long (+{slab1_pct}%)"},
+                            {"type": "Call", "action": "Sell", "row": cf_row, "desc": f"Call Short (+{slab2_pct}%)"},
+                        ]
+                    return l
+
+                pf, pn = find_closest_strike(puts, targets["pf"]), find_closest_strike(puts, targets["pn"])
+                cn, cf = find_closest_strike(calls, targets["cn"]), find_closest_strike(calls, targets["cf"])
+                if any(x is None for x in [pf, pn, cn, cf]): continue
+
+                base_legs = build_legs(pf, pn, cn, cf)
+                base_metrics = calculate_strategy_metrics(base_legs, current_price, view, lot_size, adapter)
+                
+                payload = {
+                    "ticker": ticker, "current_price": current_price, "expiry": date_str, "earnings": earnings_date,
+                    "base": {"metrics": base_metrics, "legs": base_legs}, "optimized": None 
+                }
+
+                if optimize:
+                    def get_idx(df, strike): 
+                        indices = df.index[df['strike'] == strike].tolist()
+                        return indices[0] if indices else -1
+                    
+                    pf_idx, pn_idx = get_idx(puts, pf['strike']), get_idx(puts, pn['strike'])
+                    cn_idx, cf_idx = get_idx(calls, cn['strike']), get_idx(calls, cf['strike'])
+                    
+                    if not any(i == -1 for i in [pf_idx, pn_idx, cn_idx, cf_idx]):
+                        best_ratio = -1.0
+                        best_config = None
+                        range_scan = range(-1, 2)
+                        
+                        for i1 in range_scan:
+                            for i2 in range_scan:
+                                for i3 in range_scan:
+                                    for i4 in range_scan:
+                                        if not (0<=pf_idx+i1<len(puts) and 0<=pn_idx+i2<len(puts) and 0<=cn_idx+i3<len(calls) and 0<=cf_idx+i4<len(calls)): continue
+                                        pf_cand = puts.iloc[pf_idx+i1]
+                                        pn_cand = puts.iloc[pn_idx+i2]
+                                        cn_cand = calls.iloc[cn_idx+i3]
+                                        cf_cand = calls.iloc[cf_idx+i4]
+                                        
+                                        if pf_cand['strike']>=pn_cand['strike'] or cn_cand['strike']>=cf_cand['strike']: continue
+                                        
+                                        cand_legs = build_legs(pf_cand, pn_cand, cn_cand, cf_cand)
+                                        cand_metrics = calculate_strategy_metrics(cand_legs, current_price, view, lot_size, None)
+                                        loss = abs(cand_metrics['max_loss'])
+                                        ratio = cand_metrics['max_upside'] / loss if loss > 0.01 else 0
+                                        if ratio > best_ratio:
+                                            best_ratio = ratio
+                                            best_config = {"metrics": cand_metrics, "legs": cand_legs, "ratio": ratio}
+                        
+                        if best_config:
+                            best_config['metrics'] = calculate_strategy_metrics(best_config['legs'], current_price, view, lot_size, adapter)
+                            payload["optimized"] = best_config
+                
+                results_list.append(payload)
+            except Exception as e:
+                errors.append(f"Date {date_str}: {str(e)}")
+                continue
+
+        if not results_list: return None, "Could not build strategies."
+        return results_list, None
+    except Exception as e: return None, str(e)
 
 # ==========================================
 # PART 3: MAIN APP INTERFACE
@@ -943,7 +1137,7 @@ def main():
                 with st.spinner(f"Fetching data..."):
                     for i, ticker in enumerate(tickers):
                         # Renamed function call to bust cache and force fresh data fetch
-                        summary, df, error = fetch_and_analyze_ticker_hybrid_v17(ticker, strategy, region_key, source, z_api, z_token, pct_2, pct_1, pct_3, expiry_idx)
+                        summary, df, error = fetch_and_analyze_ticker_hybrid_v19(ticker, strategy, region_key, source, z_api, z_token, pct_2, pct_1, pct_3, expiry_idx)
                         if error: errors.append(f"{ticker}: {error}")
                         else:
                             all_summaries.append(summary)
