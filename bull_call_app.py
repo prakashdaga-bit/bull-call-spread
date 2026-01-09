@@ -17,7 +17,7 @@ from io import StringIO
 st.set_page_config(page_title="Options Strategy Master", page_icon="📈", layout="wide")
 
 # ==========================================
-# NSE HELPERS (LOT SIZES)
+# F&O DATA HELPER (ZERODHA SOURCE)
 # ==========================================
 @st.cache_data(ttl=86400) # Cache for 1 day
 def get_fno_info_zerodha():
@@ -211,7 +211,7 @@ def get_monthly_expirations(ticker_obj, limit=3):
     except: return []
 
 @st.cache_data(ttl=600)
-def fetch_and_analyze_ticker_hybrid_v22(ticker, strategy_type, region="USA", source="Yahoo", z_api=None, z_token=None, pct_1=0.0, pct_2=5.0, pct_3=0.0, expiry_idx=0):
+def fetch_and_analyze_ticker_hybrid_v23(ticker, strategy_type, region="USA", source="Yahoo", z_api=None, z_token=None, pct_1=0.0, pct_2=5.0, pct_3=0.0, expiry_idx=0):
     adapter = None
     if region == "India":
         if source == "Zerodha (API)":
@@ -250,6 +250,7 @@ def fetch_and_analyze_ticker_hybrid_v22(ticker, strategy_type, region="USA", sou
             
             # --- Strategy Logic ---
             buy_strike, sell_strike = 0.0, 0.0
+            buy_prem, sell_prem = 0.0, 0.0
             
             if strategy_type == "Bull Call Spread":
                 l1, l2 = find_closest_strike(calls, p1), find_closest_strike(calls, p2)
@@ -305,38 +306,31 @@ def fetch_and_analyze_ticker_hybrid_v22(ticker, strategy_type, region="USA", sou
             # --- MARGIN & METRICS ---
             if legs:
                 margin = 0.0
-                # Priority: Zerodha API for India
                 if region == "India" and adapter and hasattr(adapter, 'get_margin_for_basket'):
                     margin = adapter.get_margin_for_basket(legs, lot_size)
                 
-                # Fallback: USA or India w/o API
+                # Fallback Margin
                 if margin == 0:
-                    if net_cost > 0: margin = net_cost * lot_size # Debit Spread (Capital = Cost)
-                    else: margin = abs(buy_strike - sell_strike) * lot_size # Credit Spread (Margin = Width)
+                    if net_cost > 0: margin = net_cost * lot_size 
+                    else: margin = abs(buy_strike - sell_strike) * lot_size 
                 
                 # Brokerage
                 brokerage = (20 * len(legs)) if region == "India" else (0.65 * len(legs))
                 
-                # Net Max Profit (Realizable)
-                # If Debit: (Max Gain * Lot) - (Net Cost * Lot) - Brokerage? No, Net Cost already paid.
-                # Max Gain (Absolute) was width. 
-                # Profit = (Width - Cost) * Lot - Brokerage
-                
-                # Standardize Profit Calc
-                total_gain_val = 0.0
+                # Net Max Profit
+                total_gain_val = (max_gain * lot_size) - brokerage
                 if strategy_type in ["Bear Call Spread", "Bull Put Spread"]:
-                    # Credit Spreads: Profit is Net Credit (which is stored in max_gain) * Lot
                     total_gain_val = (max_gain * lot_size) - brokerage
                 elif strategy_type == "Leveraged Bull Call Spread":
-                    # Logic: Upside is capped by spread, minus cost (or plus credit)
-                    total_gain_val = (max_gain * lot_size) - brokerage
-                else:
-                    # Debit Spreads: (Width - Cost) * Lot
+                     # Upside Capped at spread width, adjusted for premium/cost
+                     # Max Gain calculated above is per share
+                     total_gain_val = (max_gain * lot_size) - brokerage
+                else: # Debit Spread
                     total_gain_val = ((max_gain - net_cost) * lot_size) - brokerage
                 
                 rom = (total_gain_val / margin * 100) if margin > 0 else 0
-                roc = (max_gain / net_cost * 100) if net_cost > 0 and strategy_type not in ["Bear Call Spread", "Bull Put Spread"] else 0
-                if net_cost <= 0: roc = None # N/A for credit
+                roc = (total_gain_val / (net_cost * lot_size) * 100) if net_cost > 0 and strategy_type not in ["Bear Call Spread", "Bull Put Spread"] else 0
+                if net_cost <= 0: roc = None
 
                 res = {
                     "Expiration": str(date_str), "CMP": current_price, 
@@ -344,21 +338,20 @@ def fetch_and_analyze_ticker_hybrid_v22(ticker, strategy_type, region="USA", sou
                     "Sell Strike": sell_strike, "Sell Premium": sell_prem,
                     "Margin Required": margin, "Lot Size": lot_size,
                     "Net Cost": net_cost, "Net Max Profit": total_gain_val,
-                    "Breakeven": breakeven, "Cost / CMP %": (net_cost/current_price)*100 if current_price>0 else 0,
+                    "Breakeven": breakeven, "Cost/CMP %": (net_cost/current_price)*100 if current_price>0 else 0,
                     "Return on Margin %": rom, "Return on Cost %": roc,
-                    "Est Brokerage": brokerage
+                    "Est Brokerage": brokerage, "Max Gain": max_gain
                 }
                 rows.append(res)
         
         df = pd.DataFrame(rows)
-        # Final formatting cleanup to ensure numeric types
         for c in df.columns:
             if c != "Expiration": df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0.0)
             
-        # Enforce Column Order
+        # Reorder per user request
         order = ["Expiration", "CMP", "Buy Strike", "Buy Premium", "Sell Strike", "Sell Premium", 
                  "Margin Required", "Lot Size", "Net Cost", "Net Max Profit", "Breakeven", 
-                 "Cost / CMP %", "Return on Margin %", "Return on Cost %", "Est Brokerage"]
+                 "Cost/CMP %", "Return on Margin %", "Return on Cost %", "Est Brokerage"]
         
         final_df = df[order] if not df.empty else df
         return {}, final_df, None
@@ -369,6 +362,28 @@ def fetch_and_analyze_ticker_hybrid_v22(ticker, strategy_type, region="USA", sou
 # MAIN INTERFACE
 # ==========================================
 
+def display_strategy_details(data, label, current_price):
+    st.markdown(f"**{label}**")
+    m = data['metrics']
+    c1, c2, c3, c4 = st.columns(4)
+    net = m['net_premium']
+    lbl = "Net Credit (Total)" if net > 0 else "Net Debit (Total)"
+    total_prem = net * m['lot_size']
+    c1.metric("Margin (1 Lot)", f"${m['capital_required']:,.0f}")
+    c2.metric("Net Max Profit", f"${m['net_max_profit']:,.0f}")
+    c3.metric(f"ROI %", f"{m['roi']:.1f}%")
+    c4.metric(lbl, f"${abs(total_prem):,.0f}")
+    
+    legs_simple = []
+    for l in data['legs']:
+        legs_simple.append({
+            "Action": l['action'], "Type": l['type'], 
+            "Strike": l['row']['strike'], "Price": get_price(l['row'], 'ask' if l['action']=="Buy" else 'bid'),
+            "Description": l['desc']
+        })
+    st.dataframe(pd.DataFrame(legs_simple).style.format({"Price": "${:.2f}", "Strike": "${:.2f}"}), use_container_width=True)
+
+
 def main():
     st.title("🛡️ Options Strategy Master")
     if st.sidebar.button("🔄 Clear Cache & Restart"):
@@ -377,46 +392,125 @@ def main():
 
     region = st.sidebar.selectbox("Market Region", ["USA", "India"])
     region_key = "USA" if "USA" in region else "India"
-    source = st.sidebar.radio("Data Source", ["Yahoo", "Zerodha (API)"]) if region_key == "India" else "Yahoo"
-    z_api, z_token = load_zerodha_tokens() if source == "Zerodha (API)" else (None, None)
-
-    strategy = st.radio("Strategy", ["Bull Call Spread", "Bear Call Spread", "Bull Put Spread", "Bear Put Spread", "Leveraged Bull Call Spread"], horizontal=True)
-    
-    c1, c2, c3 = st.columns(3)
-    pct1 = c1.number_input("Strike 1 (% from Spot)", value=0.0)
-    pct2 = c2.number_input("Strike 2 (% from Spot)", value=5.0)
-    pct3 = c3.number_input("Sell Put % (Leveraged Only)", value=-5.0)
-    
-    expiry_idx = 0
-    if region_key == "India":
-        expiry_idx = ["Current", "Next", "Far"].index(st.selectbox("Expiry", ["Current", "Next", "Far"]))
-
-    if st.button("Analyze"):
-        ticker_input = st.text_input("Tickers", "RELIANCE")
-        tickers = [t.strip().upper() for t in ticker_input.split(',')]
+    source = st.sidebar.radio("Data Source", ["NSE Website (Free/Flaky)", "Zerodha (API)"]) if region_key == "India" else "Yahoo"
+    z_api, z_token = None, None
+    if source == "Zerodha (API)":
+        saved_api, saved_token = load_zerodha_tokens()
+        st.sidebar.info("Requires Kite Connect subscription.")
+        if saved_api and saved_api != st.session_state.get("z_api_input", ""):
+             st.session_state["z_api_input"] = saved_api
+        if saved_token and saved_token != st.session_state.get("z_token_input", ""):
+             st.session_state["z_token_input"] = saved_token
+        z_api = st.sidebar.text_input("API Key", key="z_api_input", type="password")
+        z_token = st.sidebar.text_input("Access Token", key="z_token_input", type="password")
         
-        all_dfs = []
-        for t in tickers:
-            _, df, err = fetch_and_analyze_ticker_hybrid_v22(t, strategy, region_key, source, z_api, z_token, pct1, pct2, pct3, expiry_idx)
-            if err: st.error(f"{t}: {err}")
-            elif not df.empty:
-                df.insert(0, "Stock", t)
-                all_dfs.append(df)
+        file_dt = get_token_file_info()
+        if file_dt:
+             hours_old = (datetime.datetime.now() - file_dt).total_seconds() / 3600
+             if hours_old > 12: st.sidebar.warning(f"⚠️ Token file is {hours_old:.1f} hours old.")
+             else: st.sidebar.success(f"✅ Token updated: {file_dt.strftime('%H:%M')}")
+
+    mode = st.sidebar.radio("Select Analysis Mode:", ["Simple Analysis (Standard)", "Custom Strategy Generator (Slab Based)"], index=0)
+    st.sidebar.markdown("---")
+    
+    if "input_simple" not in st.session_state: st.session_state["input_simple"] = ""
+    if "input_custom" not in st.session_state: st.session_state["input_custom"] = ""
+
+    presets = get_ticker_presets(region_key)
+
+    if mode == "Simple Analysis (Standard)":
+        st.subheader(f"📈 {region_key} Market Real-Time Analysis")
+        st.caption("Fetches live option chains. Standard Spreads/Straddles.")
+        strategy = st.radio("Strategy Type:", ("Bull Call Spread", "Bear Call Spread", "Bull Put Spread", "Bear Put Spread", "Long Straddle", "Leveraged Bull Call Spread"), horizontal=True)
         
-        if all_dfs:
-            full_df = pd.concat(all_dfs)
-            
-            # Custom Formatting
-            fmt = {
-                "CMP": "${:,.2f}", "Buy Strike": "{:,.1f}", "Buy Premium": "${:,.2f}",
-                "Sell Strike": "{:,.1f}", "Sell Premium": "${:,.2f}",
-                "Margin Required": "${:,.0f}", "Net Cost": "${:,.2f}",
-                "Net Max Profit": "${:,.0f}", "Breakeven": "${:,.2f}",
-                "Cost / CMP %": "{:.2f}%", "Return on Margin %": "{:.1f}%",
-                "Return on Cost %": "{:.1f}%", "Est Brokerage": "${:,.2f}"
-            }
-            
-            st.dataframe(full_df.style.format(fmt, na_rep="N/A"), use_container_width=True, hide_index=True)
+        pct_1, pct_2, pct_3 = 0.0, 5.0, -5.0
+        expiry_idx = 0
+        if region_key == "India":
+            c_exp, _ = st.columns([1,3])
+            exp_opts = ["Current Month", "Next Month", "Far Month"]
+            exp_sel = c_exp.selectbox("Select Expiry (India Only)", exp_opts)
+            try: expiry_idx = exp_opts.index(exp_sel)
+            except: expiry_idx = 0
+        
+        if strategy != "Long Straddle":
+            c1, c2, c3 = st.columns(3)
+            pct_1 = c1.number_input("Strike 1 (% from Spot)", value=0.0)
+            pct_2 = c2.number_input("Strike 2 (% from Spot)", value=5.0)
+            if strategy == "Leveraged Bull Call Spread":
+                pct_3 = c3.number_input("Sell Put % (Leveraged Only)", value=-5.0)
+        
+        def on_preset_simple_change():
+            sel = st.session_state.preset_simple
+            if sel != "Custom / Manual Input": st.session_state.input_simple = presets[sel]
+
+        c1, c2 = st.columns([1, 2])
+        c1.selectbox("Quick Load Preset", list(presets.keys()), key="preset_simple", on_change=on_preset_simple_change)
+        ticker_input = c2.text_input("Enter Tickers (comma-separated):", key="input_simple")
+        
+        if st.button("Analyze Real-Time Data"):
+            if not ticker_input: st.error("Please enter at least one ticker.")
+            elif region_key == "India" and source == "Zerodha (API)" and (not z_api or not z_token):
+                st.error("Please provide Zerodha API credentials in sidebar.")
+            else:
+                tickers = [t.strip().upper() for t in ticker_input.split(',') if t.strip()]
+                all_dfs = []
+                with st.spinner(f"Fetching data..."):
+                    for t in tickers:
+                        _, df, err = fetch_and_analyze_ticker_hybrid_v23(t, strategy, region_key, source, z_api, z_token, pct_1, pct_2, pct_3, expiry_idx)
+                        if err: st.error(f"{t}: {err}")
+                        elif not df.empty:
+                            df.insert(0, "Stock", t)
+                            all_dfs.append(df)
+                
+                if all_dfs:
+                    full_df = pd.concat(all_dfs)
+                    fmt = {
+                        "CMP": "${:,.2f}", "Buy Strike": "{:,.1f}", "Buy Premium": "${:,.2f}",
+                        "Sell Strike": "{:,.1f}", "Sell Premium": "${:,.2f}",
+                        "Margin Required": "${:,.0f}", "Net Cost": "${:,.2f}",
+                        "Net Max Profit": "${:,.0f}", "Breakeven": "${:,.2f}",
+                        "Cost/CMP %": "{:.2f}%", "Return on Margin %": "{:.1f}%",
+                        "Return on Cost %": "{:.1f}%", "Est Brokerage": "${:,.2f}"
+                    }
+                    st.dataframe(full_df.style.format(fmt, na_rep="N/A"), use_container_width=True, hide_index=True)
+
+    else:
+        st.subheader(f"🤖 {region_key} Slab-Based Strategy Generator")
+        c1, c2 = st.columns(2)
+        def on_preset_custom_change():
+            sel = st.session_state.preset_custom
+            if sel != "Custom / Manual Input": st.session_state.input_custom = presets[sel]
+
+        c1.selectbox("Quick Load Preset", list(presets.keys()), key="preset_custom", on_change=on_preset_custom_change)
+        ticker_input = c1.text_input("Stock Tickers (comma-separated)", key="input_custom").upper()
+        view = c1.selectbox("Your View", ["Neutral", "Volatile"])
+        c3, c4 = st.columns(2)
+        days_select = c3.selectbox("Expiration Window", ["Next 30 Days", "Next 60 Days", "Next 90 Days"])
+        days_map = {"Next 30 Days": 30, "Next 60 Days": 60, "Next 90 Days": 90}
+        days_window = days_map[days_select]
+        c5, c6 = st.columns(2)
+        slab1 = c5.number_input("Slab 1 (Near Strike %)", min_value=1.0, max_value=20.0, value=6.0, step=0.5)
+        slab2 = c6.number_input("Slab 2 (Far Strike %)", min_value=2.0, max_value=30.0, value=10.0, step=0.5)
+        if slab1 >= slab2: st.error("Error: Slab 1 (Near) must be smaller than Slab 2 (Far)."); stop = True
+        else: stop = False
+
+        if st.button("Generate Strategies") and not stop:
+            if not ticker_input: st.error("Please enter at least one ticker.")
+            elif region_key == "India" and source == "Zerodha (API)" and (not z_api or not z_token):
+                st.error("Please provide Zerodha API credentials in sidebar.")
+            else:
+                tickers = [t.strip().upper() for t in ticker_input.split(',') if t.strip()]
+                with st.spinner(f"Scanning expirations..."):
+                    for i, ticker in enumerate(tickers):
+                        results_list, error = analyze_custom_strategy(ticker, view, slab1, slab2, days_window, region_key, source, z_api, z_token, optimize=True)
+                        if error: st.error(f"{ticker}: {error}")
+                        else:
+                            for res in results_list:
+                                opt_data = res['optimized'] if res['optimized'] else res['base']
+                                ratio = opt_data['metrics']['max_upside'] / abs(opt_data['metrics']['max_loss'])
+                                roi = opt_data['metrics']['roi']
+                                with st.expander(f"{ticker} | 📅 {res['expiry']} | ROI {roi:.1f}% | R/R {ratio:.2f}", expanded=False):
+                                    display_strategy_details(opt_data, "Recommended Strategy", res['current_price'])
 
 if __name__ == "__main__":
     main()
