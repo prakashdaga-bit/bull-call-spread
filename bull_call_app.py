@@ -855,6 +855,11 @@ def calculate_strategy_metrics(legs, current_price, view, lot_size=1, adapter=No
     sim_range = [min(strikes) - range_width*0.5] + sim_prices + [max(strikes) + range_width*0.5]
     
     profits = []
+    # Find breakevens by checking where PnL crosses 0
+    breakeven_points = []
+    prev_pnl = None
+    prev_p = None
+    
     for p in sim_range:
         current_pnl = net_premium
         for leg in legs:
@@ -864,9 +869,39 @@ def calculate_strategy_metrics(legs, current_price, view, lot_size=1, adapter=No
             intrinsic = max(0, p - strike) if is_call else max(0, strike - p)
             current_pnl += (intrinsic if is_buy else -intrinsic)
         profits.append(current_pnl)
+        
+        # Simple linear interpolation for breakeven
+        if prev_pnl is not None:
+             if (prev_pnl > 0 and current_pnl < 0) or (prev_pnl < 0 and current_pnl > 0):
+                 # y = mx + c... approx intersection
+                 pass # For now, simple approximation logic for Iron Condor below is safer
+        prev_pnl = current_pnl
+        prev_p = p
 
     max_profit_per_share = max(profits)
     max_loss_per_share = min(profits)
+    
+    # Calculate Breakevens accurately for Iron Condor/Fly (typical Slab Strategy)
+    # BE Lower = Sell Put Strike - Net Credit (if credit)
+    # BE Upper = Sell Call Strike + Net Credit (if credit)
+    # Logic: Finding wings and centers
+    puts = sorted([l for l in legs if l['type'] == 'Put'], key=lambda x: x['row']['strike'])
+    calls = sorted([l for l in legs if l['type'] == 'Call'], key=lambda x: x['row']['strike'])
+    
+    be_str = "N/A"
+    if len(puts) == 2 and len(calls) == 2 and net_premium > 0:
+        # Credit Strategy (Condor/Fly)
+        # Sell strikes are usually inner
+        sell_put = puts[1]['row']['strike'] # Higher put is sold in bull put, but in condor:
+        # Condor: Buy Low Put, Sell Higher Put | Sell Lower Call, Buy Higher Call
+        # Let's rely on actions
+        sell_legs = [l for l in legs if l['action'] == 'Sell']
+        if len(sell_legs) == 2:
+             # Assuming standard structure
+             s_strikes = sorted([l['row']['strike'] for l in sell_legs])
+             be_lower = s_strikes[0] - net_premium
+             be_upper = s_strikes[-1] + net_premium
+             be_str = f"{be_lower:.2f} / {be_upper:.2f}"
     
     capital_required = 0.0
     if adapter and hasattr(adapter, 'get_margin_for_basket'):
@@ -876,20 +911,33 @@ def calculate_strategy_metrics(legs, current_price, view, lot_size=1, adapter=No
     if capital_required == 0:
         # Fallback logic
         total_premium_lot = net_premium * lot_size
-        puts = sorted([l for l in legs if l['type'] == 'Put'], key=lambda x: x['row']['strike'])
-        calls = sorted([l for l in legs if l['type'] == 'Call'], key=lambda x: x['row']['strike'])
         if len(puts) == 2 and len(calls) == 2:
-            width = max(abs(puts[1]['row']['strike'] - puts[0]['row']['strike']), abs(calls[1]['row']['strike'] - calls[0]['row']['strike']))
+            # Approx margin for Iron Condor: Max width of wings
+            width_put = abs(puts[1]['row']['strike'] - puts[0]['row']['strike'])
+            width_call = abs(calls[1]['row']['strike'] - calls[0]['row']['strike'])
+            width = max(width_put, width_call)
             if view == "Neutral": capital_required = width * lot_size
             else: capital_required = abs(total_premium_lot) if total_premium_lot < 0 else 0.0
 
     brokerage = 20 * 4 if lot_size > 1 else 0.05 * 4
     net_max_profit = (max_profit_per_share * lot_size) - brokerage
     roi = (net_max_profit / capital_required * 100) if capital_required > 0 else 0.0
+    
+    # Return on Cost
+    total_net_cost = -net_premium * lot_size # If credit (net_premium > 0), cost is effectively 0 or margin
+    roc = 0.0
+    if total_net_cost > 0: # Debit strategy
+        roc = (net_max_profit / total_net_cost) * 100
+        
+    # Cost / CMP
+    cost_cmp = 0.0
+    if current_price > 0 and capital_required > 0:
+        cost_cmp = ((capital_required / lot_size) / current_price) * 100
 
     return {
         "net_premium": net_premium, "max_upside": max_profit_per_share, "max_loss": max_loss_per_share,
-        "capital_required": capital_required, "brokerage": brokerage, "net_max_profit": net_max_profit, "roi": roi, "lot_size": lot_size
+        "capital_required": capital_required, "brokerage": brokerage, "net_max_profit": net_max_profit, 
+        "roi": roi, "roc": roc, "cost_cmp": cost_cmp, "lot_size": lot_size, "breakeven": be_str
     }
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -984,6 +1032,7 @@ def analyze_custom_strategy(ticker, view, slab1_pct, slab2_pct, days_window, reg
                 if any(x is None for x in [pf, pn, cn, cf]): continue
 
                 base_legs = build_legs(pf, pn, cn, cf)
+                # Pass adapter here for Base Calculation
                 base_metrics = calculate_strategy_metrics(base_legs, current_price, view, lot_size, adapter)
                 
                 payload = {
@@ -1025,6 +1074,7 @@ def analyze_custom_strategy(ticker, view, slab1_pct, slab2_pct, days_window, reg
                                             best_config = {"metrics": cand_metrics, "legs": cand_legs, "ratio": ratio}
                         
                         if best_config:
+                            # Pass adapter here for Final Optimized Calculation
                             best_config['metrics'] = calculate_strategy_metrics(best_config['legs'], current_price, view, lot_size, adapter)
                             payload["optimized"] = best_config
                 
@@ -1257,15 +1307,41 @@ def main():
                         else:
                             all_results[ticker] = results_list
                             for res in results_list:
-                                metrics = res['optimized']['metrics'] if res['optimized'] else res['base']['metrics']
-                                ratio = res['optimized']['ratio'] if res['optimized'] else (res['base']['metrics']['max_upside'] / abs(res['base']['metrics']['max_loss']))
+                                opt_data = res['optimized'] if res['optimized'] else res['base']
+                                metrics = opt_data['metrics']
+                                legs = opt_data['legs']
+                                
+                                # Extract breakdown values for summary
+                                buy_legs = [l for l in legs if l['action'] == 'Buy']
+                                sell_legs = [l for l in legs if l['action'] == 'Sell']
+                                
+                                # Helper to sum/join
+                                buy_strikes = ", ".join([f"{l['row']['strike']:.1f}" for l in buy_legs])
+                                sell_strikes = ", ".join([f"{l['row']['strike']:.1f}" for l in sell_legs])
+                                
+                                buy_prem_val = sum([get_price(l['row'], 'ask') for l in buy_legs])
+                                sell_prem_val = sum([get_price(l['row'], 'bid') for l in sell_legs])
+                                
+                                # Net Cost
+                                net_cost_val = metrics['net_premium'] * metrics['lot_size']
+                                
                                 summary_data = {
-                                    "Stock": ticker, "Next Earnings": res['earnings'], "Expiry": res['expiry'],
-                                    "Spot": f"${res['current_price']:.2f}",
-                                    "Margin (1 Lot)": f"${metrics['capital_required']:,.0f}",
+                                    "Stock": ticker, 
+                                    "Spot Price": f"${res['current_price']:.2f}",
+                                    "Buy Strike": buy_strikes,
+                                    "Buy Premium": f"${buy_prem_val:.2f}",
+                                    "Sell Strike": sell_strikes,
+                                    "Sell Premium": f"${sell_prem_val:.2f}",
+                                    "Margin Required": f"${metrics['capital_required']:,.0f}",
+                                    "Lot Size": metrics['lot_size'],
+                                    "Net Cost": f"${net_cost_val:.2f}",
                                     "Net Max Profit": f"${metrics['net_max_profit']:,.0f}",
-                                    "ROI": f"{metrics['roi']:.1f}%",
-                                    "Est. Brokerage": f"${metrics['brokerage']:.2f}"
+                                    "Breakeven": metrics['breakeven'],
+                                    "Cost/CMP %": f"{metrics['cost_cmp']:.2f}%",
+                                    "Return on Margin %": f"{metrics['roi']:.1f}%",
+                                    "Return on Cost %": f"{metrics['roc']:.1f}%",
+                                    "Est. Brokerage": f"${metrics['brokerage']:.2f}",
+                                    "Next Earnings": res['earnings']
                                 }
                                 all_summaries.append(summary_data)
                         progress_bar.progress((i + 1) / len(tickers))
