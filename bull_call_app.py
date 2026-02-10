@@ -355,12 +355,31 @@ class ZerodhaMarketAdapter:
                 'bid': float(buy.get('price', 0.0)),
                 'ask': float(sell.get('price', 0.0)),
                 'openInterest': float(q.get('oi', 0.0)),
-                'instrument_token': token
+                'instrument_token': token,
+                'tradingsymbol': row['tradingsymbol'] # Added for Trade Execution
             }
             if row['instrument_type'] == 'CE': calls_list.append(data)
             elif row['instrument_type'] == 'PE': puts_list.append(data)
                 
         return pd.DataFrame(calls_list), pd.DataFrame(puts_list)
+
+    def place_order(self, symbol, transaction_type, quantity, price):
+        """Places a single LIMIT order."""
+        try:
+            order_id = self.kite.place_order(
+                variety=self.kite.VARIETY_REGULAR,
+                exchange=self.kite.EXCHANGE_NFO,
+                tradingsymbol=symbol,
+                transaction_type=transaction_type,
+                quantity=quantity,
+                product=self.kite.PRODUCT_NRML,
+                order_type=self.kite.ORDER_TYPE_LIMIT,
+                price=price
+            )
+            return order_id
+        except Exception as e:
+            st.error(f"Order Placement Failed for {symbol}: {e}")
+            return None
 
 # ==========================================
 # SHARED HELPER FUNCTIONS
@@ -765,7 +784,9 @@ def fetch_and_analyze_ticker_hybrid_v20(ticker, strategy_type, region="USA", sou
                             "Sell Premium": get_price(sell_leg, 'bid'),
                             "IV Percentile": f"{iv_percentile:.0f}% (Est)",
                             "Buy Leg Bid": get_price(buy_leg, 'bid'), "Buy Leg Ask": get_price(buy_leg, 'ask'),
-                            "Sell Leg Bid": get_price(sell_leg, 'bid'), "Sell Leg Ask": get_price(sell_leg, 'ask')
+                            "Sell Leg Bid": get_price(sell_leg, 'bid'), "Sell Leg Ask": get_price(sell_leg, 'ask'),
+                            "Buy TradingSymbol": buy_leg.get('tradingsymbol', ''),
+                            "Sell TradingSymbol": sell_leg.get('tradingsymbol', '')
                          }
                          analysis_rows.append(row)
                          summary_returns[date_str] = "Done"
@@ -1443,40 +1464,81 @@ def main():
                     full_df = pd.concat(consolidated_data, ignore_index=True)
                     unique_expirations = sorted(full_df['Expiration'].unique())
                     for exp in unique_expirations:
-                        st.subheader(f"Expiry: {exp}")
                         subset = full_df[full_df['Expiration'] == exp].drop(columns=['Expiration'])
                         
-                        cols_to_show = []
-                        if strategy == "Long Straddle":
-                            format_dict = {
-                                "Spot Price": "${:,.2f}", "Call Cost": "${:,.2f}", "Put Cost": "${:,.2f}",
-                                "Net Cost": "${:,.2f}", "Cost/CMP %": "{:.2f}%", "BE Low": "${:,.2f}",
-                                "BE High": "${:,.2f}", "Move Needed": "{:.1f}%", "Margin Required": "${:,.0f}"
-                            }
-                        elif strategy == "Leveraged Bull Call Spread":
-                             format_dict = {
-                                "Spot Price": "${:,.2f}", "Net Cost": "${:,.2f}", "Margin Required": "${:,.0f}",
-                                "Return on Margin %": "{:.1f}%", "Return on Cost %": "{:.1f}%", 
-                                "Max Gain": "${:,.2f}", "Breakeven": "${:,.2f}",
-                                "Buy Call Strike": "${:,.2f}", "Sell Call Strike": "${:,.2f}", "Sell Put Strike": "${:,.2f}",
-                                "Est. Brokerage": "${:,.2f}", "Net Max Profit": "${:,.0f}"
-                            }
+                        if strategy == "Trade Recommendation":
+                            # Custom Table with Buttons
+                            st.write(f"### Expiry: {exp}")
+                            
+                            # Headers
+                            cols = st.columns([1.5, 1, 1, 1, 1, 1, 1, 1, 1, 1])
+                            headers = ["Stock", "Strategy", "Spot", "Buy Strike", "Sell Strike", "Net Credit", "Margin", "Max Profit", "ROI", "Action"]
+                            for c, h in zip(cols, headers):
+                                c.markdown(f"**{h}**")
+                            
+                            for idx, row in subset.iterrows():
+                                c1, c2, c3, c4, c5, c6, c7, c8, c9, c10 = st.columns([1.5, 1, 1, 1, 1, 1, 1, 1, 1, 1])
+                                c1.write(row['Stock'])
+                                c2.write(row['Strategy'])
+                                c3.write(f"{row['Spot Price']:.2f}")
+                                c4.write(f"{row['Buy Strike']:.0f} (@{row['Buy Premium']:.1f})")
+                                c5.write(f"{row['Sell Strike']:.0f} (@{row['Sell Premium']:.1f})")
+                                c6.write(f"{abs(row['Net Cost']):.0f}")
+                                c7.write(f"{row['Margin Required']:.0f}")
+                                c8.write(f"{row['Net Max Profit']:.0f}")
+                                c9.write(f"{row['Return on Margin %']:.1f}%")
+                                
+                                # Trade Button
+                                if c10.button("Trade", key=f"trade_{idx}_{row['Stock']}"):
+                                    if not z_api or not z_token:
+                                        st.error("Login Required")
+                                    else:
+                                        # Execute Trade
+                                        t_adapter = ZerodhaMarketAdapter(z_api, z_token)
+                                        if t_adapter.connect():
+                                            qty = int(row['Lot Size'])
+                                            # Buy Leg
+                                            st.toast(f"Placing Buy Order for {row['Buy TradingSymbol']}...")
+                                            oid1 = t_adapter.place_order(row['Buy TradingSymbol'], t_adapter.kite.TRANSACTION_TYPE_BUY, qty, row['Buy Leg Ask'])
+                                            
+                                            if oid1:
+                                                time.sleep(0.5) # Small delay
+                                                st.toast(f"Placing Sell Order for {row['Sell TradingSymbol']}...")
+                                                oid2 = t_adapter.place_order(row['Sell TradingSymbol'], t_adapter.kite.TRANSACTION_TYPE_SELL, qty, row['Sell Leg Bid'])
+                                                if oid2:
+                                                    st.success(f"Trade Executed! IDs: {oid1}, {oid2}")
                         else:
-                            format_dict = {
-                                "Spot Price": "${:,.2f}", "Buy Premium": "${:,.2f}", "Sell Premium": "${:,.2f}",
-                                "Buy Strike": "${:,.2f}", "Sell Strike": "${:,.2f}",
-                                "Net Cost": "${:,.2f}", "Cost/CMP %": "{:.2f}%", "Max Gain": "${:,.2f}",
-                                "Margin Required": "${:,.0f}", "Lot Size": "{:,.0f}",
-                                "Breakeven": "${:,.2f}", "Return on Margin %": "{:.1f}%", "Return on Cost %": "{:.1f}%",
-                                "Est. Brokerage": "${:,.2f}", "Net Max Profit": "${:,.0f}",
-                                "Buy Leg Bid": "${:,.2f}", "Buy Leg Ask": "${:,.2f}",
-                                "Sell Leg Bid": "${:,.2f}", "Sell Leg Ask": "${:,.2f}"
-                            }
-                        
-                        try:
-                            st.dataframe(subset.style.format(format_dict, na_rep="N/A"), hide_index=True, use_container_width=True)
-                        except:
-                            st.dataframe(subset, hide_index=True, use_container_width=True)
+                            cols_to_show = []
+                            if strategy == "Long Straddle":
+                                format_dict = {
+                                    "Spot Price": "${:,.2f}", "Call Cost": "${:,.2f}", "Put Cost": "${:,.2f}",
+                                    "Net Cost": "${:,.2f}", "Cost/CMP %": "{:.2f}%", "BE Low": "${:,.2f}",
+                                    "BE High": "${:,.2f}", "Move Needed": "{:.1f}%", "Margin Required": "${:,.0f}"
+                                }
+                            elif strategy == "Leveraged Bull Call Spread":
+                                 format_dict = {
+                                    "Spot Price": "${:,.2f}", "Net Cost": "${:,.2f}", "Margin Required": "${:,.0f}",
+                                    "Return on Margin %": "{:.1f}%", "Return on Cost %": "{:.1f}%", 
+                                    "Max Gain": "${:,.2f}", "Breakeven": "${:,.2f}",
+                                    "Buy Call Strike": "${:,.2f}", "Sell Call Strike": "${:,.2f}", "Sell Put Strike": "${:,.2f}",
+                                    "Est. Brokerage": "${:,.2f}", "Net Max Profit": "${:,.0f}"
+                                }
+                            else:
+                                format_dict = {
+                                    "Spot Price": "${:,.2f}", "Buy Premium": "${:,.2f}", "Sell Premium": "${:,.2f}",
+                                    "Buy Strike": "${:,.2f}", "Sell Strike": "${:,.2f}",
+                                    "Net Cost": "${:,.2f}", "Cost/CMP %": "{:.2f}%", "Max Gain": "${:,.2f}",
+                                    "Margin Required": "${:,.0f}", "Lot Size": "{:,.0f}",
+                                    "Breakeven": "${:,.2f}", "Return on Margin %": "{:.1f}%", "Return on Cost %": "{:.1f}%",
+                                    "Est. Brokerage": "${:,.2f}", "Net Max Profit": "${:,.0f}",
+                                    "Buy Leg Bid": "${:,.2f}", "Buy Leg Ask": "${:,.2f}",
+                                    "Sell Leg Bid": "${:,.2f}", "Sell Leg Ask": "${:,.2f}"
+                                }
+                            
+                            try:
+                                st.dataframe(subset.style.format(format_dict, na_rep="N/A"), hide_index=True, use_container_width=True)
+                            except:
+                                st.dataframe(subset, hide_index=True, use_container_width=True)
 
                 elif not errors: st.warning("No valid data found.")
 
