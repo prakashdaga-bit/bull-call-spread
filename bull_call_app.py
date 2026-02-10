@@ -551,20 +551,166 @@ def fetch_and_analyze_ticker_hybrid_v20(ticker, strategy_type, region="USA", sou
             puts = filter_tradeable_options(puts)
             
             if calls.empty or puts.empty: continue
+            
+            # SORT CHAINS FOR INDEXING
+            calls = calls.sort_values('strike').reset_index(drop=True)
+            puts = puts.sort_values('strike').reset_index(drop=True)
 
-            # 5. Run Simple Strategy Logic
+            # 5. Run Strategy Logic
             try:
                 # Common Vars
                 buy_leg, sell_leg, put_leg = None, None, None
                 buy_strike, sell_strike, put_strike = 0.0, 0.0, 0.0
                 buy_prem, sell_prem, put_prem = 0.0, 0.0, 0.0
                 net_cost, max_gain, breakeven, ret_pct, margin, rom_pct, roc_pct = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+                legs_list = []
                 
                 # Targets
                 price_1 = current_price * (1 + pct_1/100.0)
                 price_2 = current_price * (1 + pct_2/100.0)
                 
-                legs_list = []
+                # --- NEW TRADE RECOMMENDATION LOGIC ---
+                if strategy_type == "Trade Recommendation":
+                    # Optimize Bull Put and Bear Call based on Credit
+                    # Bull Put: Sell 3-7% OTM (Below Spot), Buy 2-4 strikes lower
+                    # Bear Call: Sell 3-7% OTM (Above Spot), Buy 2-4 strikes higher
+                    
+                    strategies_to_check = []
+                    
+                    # 1. OPTIMIZE BULL PUT
+                    # Filter potential Sell Puts (Strike < Spot) in range 3-7% OTM
+                    target_high = current_price * 0.97
+                    target_low = current_price * 0.93
+                    potential_sell_puts = puts[(puts['strike'] >= target_low) & (puts['strike'] <= target_high)]
+                    
+                    best_bull_put = None
+                    max_credit_bull = -1.0
+                    
+                    for idx, row in potential_sell_puts.iterrows():
+                        # Find original index in full `puts` df to find gaps
+                        try:
+                            # Because we reset index, we need to map back or iterate full list intelligently
+                            # Simpler: Iterate full list, check criteria
+                            pass
+                        except: continue
+                        
+                    # Re-loop with indices
+                    for i in range(len(puts)):
+                        sell_cand = puts.iloc[i]
+                        if not (target_low <= sell_cand['strike'] <= target_high): continue
+                        
+                        # Check Buy Legs (2, 3, 4 strikes below -> smaller index)
+                        for gap in [2, 3, 4]:
+                            if i - gap < 0: continue
+                            buy_cand = puts.iloc[i - gap]
+                            
+                            s_bid = get_price(sell_cand, 'bid')
+                            b_ask = get_price(buy_cand, 'ask')
+                            if s_bid == 0 or b_ask == 0: continue
+                            
+                            credit = s_bid - b_ask
+                            if credit > max_credit_bull:
+                                max_credit_bull = credit
+                                best_bull_put = {
+                                    "type": "Bull Put Rec",
+                                    "buy_leg": buy_cand, "sell_leg": sell_cand,
+                                    "net_cost": -credit, "legs": [
+                                        {'row': buy_cand.to_dict(), 'action': 'Buy', 'type': 'Put'},
+                                        {'row': sell_cand.to_dict(), 'action': 'Sell', 'type': 'Put'}
+                                    ]
+                                }
+
+                    # 2. OPTIMIZE BEAR CALL
+                    # Filter potential Sell Calls (Strike > Spot) in range 3-7% OTM
+                    target_call_low = current_price * 1.03
+                    target_call_high = current_price * 1.07
+                    
+                    best_bear_call = None
+                    max_credit_bear = -1.0
+                    
+                    for i in range(len(calls)):
+                        sell_cand = calls.iloc[i]
+                        if not (target_call_low <= sell_cand['strike'] <= target_call_high): continue
+                        
+                        # Check Buy Legs (2, 3, 4 strikes above -> larger index)
+                        for gap in [2, 3, 4]:
+                            if i + gap >= len(calls): continue
+                            buy_cand = calls.iloc[i + gap]
+                            
+                            s_bid = get_price(sell_cand, 'bid')
+                            b_ask = get_price(buy_cand, 'ask')
+                            if s_bid == 0 or b_ask == 0: continue
+                            
+                            credit = s_bid - b_ask
+                            if credit > max_credit_bear:
+                                max_credit_bear = credit
+                                best_bear_call = {
+                                    "type": "Bear Call Rec",
+                                    "buy_leg": buy_cand, "sell_leg": sell_cand,
+                                    "net_cost": -credit, "legs": [
+                                        {'row': buy_cand.to_dict(), 'action': 'Buy', 'type': 'Call'},
+                                        {'row': sell_cand.to_dict(), 'action': 'Sell', 'type': 'Call'}
+                                    ]
+                                }
+                    
+                    if best_bull_put: strategies_to_check.append(best_bull_put)
+                    if best_bear_call: strategies_to_check.append(best_bear_call)
+                    
+                    # Process found recommendations
+                    for strat in strategies_to_check:
+                         buy_leg = strat['buy_leg']
+                         sell_leg = strat['sell_leg']
+                         net_cost = strat['net_cost']
+                         legs_list = strat['legs']
+                         rec_type = strat['type']
+                         
+                         buy_strike, sell_strike = buy_leg['strike'], sell_leg['strike']
+                         
+                         margin = 0.0
+                         if adapter and hasattr(adapter, 'get_margin_for_basket'):
+                             margin = adapter.get_margin_for_basket(legs_list, lot_size)
+                         if margin == 0:
+                             margin = abs(buy_strike - sell_strike) * lot_size
+                         
+                         max_gain = abs(net_cost) # Credit
+                         
+                         # Breakeven
+                         if "Bull" in rec_type: breakeven = sell_strike - max_gain
+                         else: breakeven = sell_strike + max_gain
+
+                         total_max_gain = max_gain * lot_size
+                         if margin > 0: rom_pct = (total_max_gain / margin) * 100
+                         else: rom_pct = 0.0
+                         
+                         brokerage = 20 * 4 if lot_size > 1 else 0.05 * 4
+                         net_max_profit_val = total_max_gain - brokerage
+                         
+                         # Add to results
+                         cost_cmp_pct = (margin / lot_size / current_price * 100) if (lot_size > 0 and current_price > 0) else 0.0
+                         
+                         row = {
+                            "Strategy": rec_type,
+                            "Expiration": date_str, 
+                            "Spot Price": float(current_price),
+                            "Lot Size": lot_size,
+                            "Net Cost": net_cost,
+                            "Cost/CMP %": cost_cmp_pct,
+                            "Max Gain": max_gain, 
+                            "Margin Required": margin, 
+                            "Return on Margin %": rom_pct,
+                            "Return on Cost %": None, # Credit strategy usually undefined or infinite ROC
+                            "Breakeven": breakeven,
+                            "Est. Brokerage": brokerage,
+                            "Net Max Profit": net_max_profit_val,
+                            "Buy Strike": buy_strike, "Buy Premium": get_price(buy_leg, 'ask'),
+                            "Sell Strike": sell_strike, "Sell Premium": get_price(sell_leg, 'bid'),
+                         }
+                         analysis_rows.append(row)
+                         summary_returns[date_str] = "Done"
+                         
+                    continue # Skip standard logic below
+                
+                # --- STANDARD STRATEGY LOGIC (Existing) ---
                 
                 # Determine View for Margin Calculation
                 view_for_calc = "Volatile" # Default Debit
@@ -822,7 +968,11 @@ def fetch_and_analyze_ticker_hybrid_v20(ticker, strategy_type, region="USA", sou
              # g) Margin Required, h) Lot Size, i) Net Cost, j) Net Max Profit, k) Breakeven, l) Cost/CMP %, 
              # m) Return on Margin %, n) Return on Cost %, o) Est. Brokerage
              # Adding Expiration at start usually
-             cols = ["Expiration", "Spot Price", "Buy Strike", "Buy Premium", "Sell Strike", "Sell Premium", 
+             
+             # Add 'Strategy' if present (Trade Rec)
+             prefix_cols = ["Expiration", "Strategy"] if "Strategy" in df.columns else ["Expiration"]
+             
+             cols = prefix_cols + ["Spot Price", "Buy Strike", "Buy Premium", "Sell Strike", "Sell Premium", 
                      "Margin Required", "Lot Size", "Net Cost", "Net Max Profit", "Breakeven", 
                      "Cost/CMP %", "Return on Margin %", "Return on Cost %", "Est. Brokerage"]
              
@@ -1162,7 +1312,7 @@ def main():
     if mode == "Simple Analysis (Standard)":
         st.subheader(f"📈 {region_key} Market Real-Time Analysis")
         st.caption("Fetches live option chains. Standard Spreads/Straddles.")
-        strategy = st.radio("Strategy Type:", ("Bull Call Spread", "Bear Call Spread", "Bull Put Spread", "Bear Put Spread", "Long Straddle", "Leveraged Bull Call Spread"), horizontal=True)
+        strategy = st.radio("Strategy Type:", ("Trade Recommendation", "Bull Call Spread", "Bear Call Spread", "Bull Put Spread", "Bear Put Spread", "Long Straddle", "Leveraged Bull Call Spread"), horizontal=True)
         
         pct_1 = 0.0
         pct_2 = 5.0
@@ -1176,13 +1326,16 @@ def main():
             try: expiry_idx = exp_opts.index(exp_sel)
             except: expiry_idx = 0
         
-        if strategy != "Long Straddle":
+        # Inputs (Hide for Trade Recommendation if desired, but user can just ignore)
+        if strategy != "Long Straddle" and strategy != "Trade Recommendation":
             c1, c2, c3 = st.columns(3)
             pct_1 = c1.number_input("Strike 1 (% from Spot)", min_value=-50.0, max_value=50.0, value=0.0, step=0.5)
             pct_2 = c2.number_input("Strike 2 (% from Spot)", min_value=-50.0, max_value=50.0, value=5.0, step=0.5)
             
             if strategy == "Leveraged Bull Call Spread":
                 pct_3 = c3.number_input("Sell Put Strike (% from Spot)", min_value=-50.0, max_value=0.0, value=0.0, step=0.5)
+        elif strategy == "Trade Recommendation":
+             st.info("💡 Recommendation Mode: Optimizes Credit Spreads (Bull Put & Bear Call) automatically. Inputs below are ignored.")
         
         def on_preset_simple_change():
             sel = st.session_state.preset_simple
