@@ -1730,7 +1730,7 @@ def main():
             try:
                 genai.configure(api_key=gemini_api_key)
                 # Using latest Gemini 3.0 Pro model
-                model = genai.GenerativeModel('gemini-3.0-pro') 
+                model = genai.GenerativeModel("models/gemini-3.0-pro") 
             except Exception as e:
                 st.error(f"Error configuring Gemini API: {e}")
             
