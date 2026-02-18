@@ -11,10 +11,31 @@ from dataclasses import dataclass
 from typing import List, Optional, Dict, Union
 from io import StringIO
 
+# Try importing Gemini SDK
+try:
+    import google.generativeai as genai
+    GENAI_AVAILABLE = True
+except ImportError:
+    GENAI_AVAILABLE = False
+
+# Try importing PDF reader for Document upload
+try:
+    import PyPDF2
+    PYPDF_AVAILABLE = True
+except ImportError:
+    PYPDF_AVAILABLE = False
+
+
 # ==========================================
 # GLOBAL CONFIGURATION
 # ==========================================
 st.set_page_config(page_title="Options Strategy Master", page_icon="📈", layout="wide")
+
+# Initialize Session State variables for Chat Context
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+if "last_summary" not in st.session_state:
+    st.session_state.last_summary = ""
 
 # ==========================================
 # MATH HELPERS (IV CALCULATION)
@@ -1325,6 +1346,28 @@ def analyze_custom_strategy(ticker, view, slab1_pct, slab2_pct, days_window, reg
         return results_list, None
     except Exception as e: return None, str(e)
 
+
+# ==========================================
+# FILE EXTRACTION HELPER FOR CHAT
+# ==========================================
+def extract_text_from_file(uploaded_file):
+    """Extract text from uploaded TXT, CSV, or PDF file."""
+    if uploaded_file.name.endswith('.txt') or uploaded_file.name.endswith('.csv'):
+        return uploaded_file.getvalue().decode("utf-8")
+    elif uploaded_file.name.endswith('.pdf') and PYPDF_AVAILABLE:
+        try:
+            pdf_reader = PyPDF2.PdfReader(uploaded_file)
+            text = ""
+            for page in pdf_reader.pages:
+                text += page.extract_text() + "\n"
+            return text
+        except Exception as e:
+            return f"Error reading PDF: {e}"
+    elif uploaded_file.name.endswith('.pdf') and not PYPDF_AVAILABLE:
+        return "PDF parsing requires PyPDF2. Please run `pip install PyPDF2`"
+    return "Unsupported file type."
+
+
 # ==========================================
 # PART 3: MAIN APP INTERFACE
 # ==========================================
@@ -1390,6 +1433,19 @@ def main():
         ["Simple Analysis (Standard)", "Custom Strategy Generator (Slab Based)"],
         index=0
     )
+    
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 🤖 Gemini AI Integration")
+    
+    # Try to load key from Streamlit Secrets first
+    gemini_api_key = st.secrets.get("GEMINI_API_KEY", "")
+    
+    if gemini_api_key:
+        st.sidebar.success("✅ Gemini AI Active (Loaded from secrets)")
+    else:
+        # Fallback for users running locally without a secrets file
+        gemini_api_key = st.sidebar.text_input("Gemini API Key", type="password", placeholder="Enter key for chat...")
+    
     st.sidebar.markdown("---")
     
     if "input_simple" not in st.session_state: st.session_state["input_simple"] = ""
@@ -1462,6 +1518,10 @@ def main():
                 if consolidated_data:
                     st.header("1. Strategy Summary")
                     full_df = pd.concat(consolidated_data, ignore_index=True)
+                    
+                    # Store to context for Gemini to read
+                    st.session_state.last_summary = full_df.to_markdown(index=False)
+                    
                     unique_expirations = sorted(full_df['Expiration'].unique())
                     for exp in unique_expirations:
                         subset = full_df[full_df['Expiration'] == exp].drop(columns=['Expiration'])
@@ -1633,6 +1693,10 @@ def main():
                 if all_summaries:
                     st.header("1. Strategy Summary (Optimized)")
                     summary_df = pd.DataFrame(all_summaries)
+                    
+                    # Store to context for Gemini to read
+                    st.session_state.last_summary = summary_df.to_markdown(index=False)
+                    
                     st.dataframe(summary_df, hide_index=True, use_container_width=True)
                     st.header("2. Detailed Trade Analysis")
                     for ticker, results_list in all_results.items():
@@ -1646,6 +1710,73 @@ def main():
                 if errors:
                     with st.expander("Errors / Skipped Tickers"):
                         for err in errors: st.write(f"- {err}")
+
+    # ========================================================
+    # NEW: GEMINI CHAT INTERFACE
+    # ========================================================
+    st.divider()
+    st.header("💬 Gemini Options Assistant")
+    
+    if not GENAI_AVAILABLE:
+        st.error("⚠️ `google-generativeai` package is missing. Please run: `pip install google-generativeai`")
+    else:
+        if not gemini_api_key:
+            st.info("👈 Please enter your Gemini Enterprise API Key in the sidebar to activate the Chat Assistant.")
+        else:
+            try:
+                genai.configure(api_key=gemini_api_key)
+                # You can swap model string below if needed
+                model = genai.GenerativeModel('gemini-1.5-pro-latest') 
+            except Exception as e:
+                st.error(f"Error configuring Gemini API: {e}")
+            
+            with st.expander("📎 Upload Document for Context (Optional)", expanded=False):
+                uploaded_doc = st.file_uploader("Upload PDF, CSV, or TXT file", type=['pdf', 'txt', 'csv'])
+                
+                doc_text = ""
+                if uploaded_doc is not None:
+                    with st.spinner("Extracting text..."):
+                        doc_text = extract_text_from_file(uploaded_doc)
+                    if doc_text:
+                        st.success(f"Document '{uploaded_doc.name}' loaded successfully! ({len(doc_text)} chars)")
+
+            # Display Chat History
+            for msg in st.session_state.chat_history:
+                with st.chat_message(msg["role"]):
+                    st.markdown(msg["content"])
+                    
+            # Chat Input
+            if prompt := st.chat_input("Ask about the active strategy, documents, or general options..."):
+                # Append user msg to UI
+                st.session_state.chat_history.append({"role": "user", "content": prompt})
+                with st.chat_message("user"):
+                    st.markdown(prompt)
+                
+                # Build context for the AI
+                system_context = "You are a professional options trading assistant.\n\n"
+                
+                if st.session_state.last_summary:
+                    system_context += "### Current Generated Options Strategies Data:\n"
+                    system_context += f"{st.session_state.last_summary}\n\n"
+                
+                if doc_text:
+                    system_context += f"### User Uploaded Document Context:\n{doc_text[:25000]}\n\n" # Truncated to avoid immense context blasts for basic models
+                    
+                full_prompt = f"{system_context}\nUser Query: {prompt}"
+                
+                # Fetch Response
+                with st.chat_message("assistant"):
+                    message_placeholder = st.empty()
+                    try:
+                        with st.spinner("Thinking..."):
+                            # We send it as a fresh generation to easily inject the massive data string safely
+                            response = model.generate_content(full_prompt)
+                            reply_text = response.text
+                            message_placeholder.markdown(reply_text)
+                            
+                            st.session_state.chat_history.append({"role": "assistant", "content": reply_text})
+                    except Exception as e:
+                        st.error(f"Error communicating with Gemini API: {e}")
 
 if __name__ == "__main__":
     main()
