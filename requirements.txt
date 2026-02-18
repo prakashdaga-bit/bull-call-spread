@@ -6,3 +6,5 @@ kiteconnect
 selenium
 pyotp
 webdriver-manager
+google-generativeai
+PyPDF2
