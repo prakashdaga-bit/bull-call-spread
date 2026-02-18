@@ -1438,7 +1438,11 @@ def main():
     st.sidebar.markdown("### 🤖 Gemini AI Integration")
     
     # Try to load key from Streamlit Secrets first
-    gemini_api_key = st.secrets.get("GEMINI_API_KEY", "")
+    gemini_api_key = ""
+    try:
+        gemini_api_key = st.secrets.get("GEMINI_API_KEY", "")
+    except FileNotFoundError:
+        pass
     
     if gemini_api_key:
         st.sidebar.success("✅ Gemini AI Active (Loaded from secrets)")
@@ -1519,8 +1523,8 @@ def main():
                     st.header("1. Strategy Summary")
                     full_df = pd.concat(consolidated_data, ignore_index=True)
                     
-                    # Store to context for Gemini to read
-                    st.session_state.last_summary = full_df.to_markdown(index=False)
+                    # Store to context for Gemini to read using built-in to_csv instead of tabulate
+                    st.session_state.last_summary = full_df.to_csv(index=False)
                     
                     unique_expirations = sorted(full_df['Expiration'].unique())
                     for exp in unique_expirations:
@@ -1694,8 +1698,8 @@ def main():
                     st.header("1. Strategy Summary (Optimized)")
                     summary_df = pd.DataFrame(all_summaries)
                     
-                    # Store to context for Gemini to read
-                    st.session_state.last_summary = summary_df.to_markdown(index=False)
+                    # Store to context for Gemini to read using built-in to_csv instead of tabulate
+                    st.session_state.last_summary = summary_df.to_csv(index=False)
                     
                     st.dataframe(summary_df, hide_index=True, use_container_width=True)
                     st.header("2. Detailed Trade Analysis")
@@ -1725,8 +1729,8 @@ def main():
         else:
             try:
                 genai.configure(api_key=gemini_api_key)
-                # You can swap model string below if needed
-                model = genai.GenerativeModel('gemini-1.5-pro-latest') 
+                # Using latest Gemini 3.0 Pro model
+                model = genai.GenerativeModel('gemini-3.0-pro') 
             except Exception as e:
                 st.error(f"Error configuring Gemini API: {e}")
             
